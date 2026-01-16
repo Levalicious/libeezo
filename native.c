@@ -784,7 +784,7 @@ static void emit_gc(NativeEmit *e) {
     x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
     
     /* Default: 1 word (S, K, I, Halt) */
-    u32 do_copy = x86_len(b);
+    x86_mov_ri(b, RCX, 8);
     x86_jmp_rel(b, 0);
     u32 do_copy_jmp = x86_len(b) - 4;
     
@@ -805,56 +805,41 @@ static void emit_gc(NativeEmit *e) {
     x86_patch_rel32(b, size_ak2, size_3_target);
     x86_mov_ri(b, RCX, 24);
     
-    /* Do the copy */
+    /* Do the copy - rcx = size in bytes, rdi = source */
     u32 do_copy_target = x86_len(b);
     x86_patch_rel32(b, do_copy_jmp, do_copy_target);
     x86_patch_rel32(b, size_2_jmp, do_copy_target);
     
-    /* rax = hp (destination) */
+    /* Save size in r11 (caller-saved, safe to use here) */
+    x86_mov_rr(b, R11, RCX);
+    
+    /* rax = hp (destination, also return value) */
     x86_mov_rr(b, RAX, R12);
     
-    /* Copy rcx bytes from rdi to rax */
-    /* Use rep movsb: rsi=src, rdi=dst, rcx=count */
-    x86_push(b, RDI);
-    x86_mov_rr(b, RSI, RDI);  /* src */
-    x86_mov_rr(b, RDI, RAX);  /* dst */
-    /* rep movsb */
-    x86_byte(b, 0xF3); x86_byte(b, 0xA4);
-    x86_pop(b, RDI);
-    
-    /* Bump hp */
-    /* r12 += rcx (but rcx was modified by rep movsb - it's now 0) */
-    /* Need to recalculate size. Actually, rdi moved by rcx, so new hp = rdi after movsb */
-    /* Wait, we pushed/popped RDI. Let me redo. */
-    /* Actually the movsb modifies RSI and RDI. After movsb, RDI points past the copy. */
-    /* But we pushed original RDI (source). */
-    
-    /* Let me use a simpler approach: save size before movsb */
-    /* Rewrite this section */
-    
-    /* Actually, let's just manually copy based on size */
-    /* Scrap rep movsb, do explicit stores */
-    
-    /* This is getting messy. Let me simplify: always copy 3 words (max size) */
-    /* Wasteful but simple */
-    
-    /* rax = hp */
-    x86_mov_rr(b, RAX, R12);
-    
-    /* Copy 3 words (24 bytes) */
+    /* Copy based on size: always copy word 0 */
     x86_mov_rm(b, RCX, RDI, 0);
     x86_mov_mr(b, RAX, 0, RCX);
+    
+    /* If size >= 16, copy word 1 */
+    x86_cmp_ri(b, R11, 16);
+    u32 skip_word1 = x86_len(b) + 2;
+    x86_byte(b, 0x0F); x86_byte(b, 0x82); x86_dword(b, 0);  /* jb skip */
     x86_mov_rm(b, RCX, RDI, 8);
     x86_mov_mr(b, RAX, 8, RCX);
+    u32 skip_word1_target = x86_len(b);
+    x86_patch_rel32(b, skip_word1, skip_word1_target);
+    
+    /* If size >= 24, copy word 2 */
+    x86_cmp_ri(b, R11, 24);
+    u32 skip_word2 = x86_len(b) + 2;
+    x86_byte(b, 0x0F); x86_byte(b, 0x82); x86_dword(b, 0);  /* jb skip */
     x86_mov_rm(b, RCX, RDI, 16);
     x86_mov_mr(b, RAX, 16, RCX);
+    u32 skip_word2_target = x86_len(b);
+    x86_patch_rel32(b, skip_word2, skip_word2_target);
     
-    /* Bump hp by actual size - but we lost the size! */
-    /* OK let me properly save it */
-    
-    /* This is a mess. I'll do a proper rewrite with the size preserved. */
-    /* For now, let's just always bump by 24 (3 words) - wastes space but works */
-    x86_add_ri(b, R12, 24);
+    /* Bump hp by actual size (r11) */
+    x86_add_rr(b, R12, R11);
     emit_store_data(b, DATA_HP, R12);
     
     /* Install forwarding pointer in old location */
