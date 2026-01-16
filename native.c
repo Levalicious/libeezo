@@ -1090,6 +1090,48 @@ static void emit_output_bit(X86Buf *b) {
 }
 
 /*
+ * Helper: output a single bit with XOR against DATA_OUTPUT_XOR
+ * Input: rdi = bit value (0 or 1)
+ * Used for Jot/Jomplement: XOR mask is 0 for Jot, 1 for Jomplement
+ */
+static void emit_output_bit_xor(X86Buf *b) {
+    /* XOR rdi with DATA_OUTPUT_XOR */
+    emit_load_data(b, RAX, DATA_OUTPUT_XOR);
+    x86_byte(b, 0x48); x86_byte(b, 0x31); x86_byte(b, 0xC7);  /* xor rdi, rax */
+    
+    /* Then do normal output */
+    emit_load_data(b, RAX, DATA_OUTBUF);
+    emit_load_data(b, RCX, DATA_OUTPOS);
+    
+    x86_mov_rr(b, RDX, RDI);
+    x86_byte(b, 0x48); x86_byte(b, 0x83); x86_byte(b, 0xE2); x86_byte(b, 0x01);  /* and rdx, 1 */
+    x86_add_ri(b, RDX, '0');
+    
+    x86_byte(b, 0x88); x86_byte(b, 0x14); x86_byte(b, 0x08);  /* mov [rax+rcx], dl */
+    
+    x86_add_ri(b, RCX, 1);
+    emit_store_data(b, DATA_OUTPOS, RCX);
+    
+    emit_load_data(b, RDX, DATA_OUTLEN);
+    x86_cmp_rr(b, RCX, RDX);
+    u32 skip_flush = x86_len(b) + 2;
+    x86_byte(b, 0x0F); x86_byte(b, 0x82); x86_dword(b, 0);
+    
+    x86_push(b, R14);
+    x86_mov_ri(b, RAX, SYS_write);
+    x86_mov_ri(b, RDI, 1);
+    emit_load_data(b, RSI, DATA_OUTBUF);
+    emit_load_data(b, RDX, DATA_OUTPOS);
+    emit_syscall(b);
+    x86_pop(b, R14);
+    
+    x86_mov_ri(b, RCX, 0);
+    emit_store_data(b, DATA_OUTPOS, RCX);
+    
+    x86_patch_rel32(b, skip_flush, x86_len(b));
+}
+
+/*
  * Helper: flush remaining output buffer and exit
  */
 static void emit_flush_and_exit(X86Buf *b) {
@@ -1350,36 +1392,255 @@ static void emit_output_bcl(NativeEmit *e) {
 }
 
 /*
- * Jot Output Routine
+ * Jot/Jomplement Output Routine
  * 
- * Jot encoding: I=empty, K=00, S=1, App(a,b)=encode(a)+encode(b)+0
- * Note: This is different from BCL!
+ * Jot encoding (verified from esolangs):
+ *   K = 11100 (5 bits)
+ *   S = 11111000 (8 bits)
+ *   I = SKK = 1 + 1 + 11111000 + 11100 + 11100 = 20 bits
+ *   App(a,b) = 1 + encode(a) + encode(b)
+ *
+ * Same traversal structure as BCL, just different bit patterns.
+ * Uses DATA_OUTPUT_XOR: 0 for Jot, 1 for Jomplement (all bits inverted).
  */
-static void emit_output_jot(NativeEmit *e) {
+static void emit_output_jot_impl(NativeEmit *e) {
     X86Buf *b = &e->code;
     e->output_offset = x86_len(b);
     
-    /* TODO: Implement Jot serialization */
-    /* For now, just exit - placeholder */
-    x86_mov_ri(b, RAX, SYS_exit);
+    /* Allocate output buffer (4KB) via mmap */
+    x86_mov_ri(b, RAX, SYS_mmap);
     x86_mov_ri(b, RDI, 0);
+    x86_mov_ri(b, RSI, 4096);
+    x86_mov_ri(b, RDX, MMAP_PROT_RW);
+    x86_mov_ri(b, R10, MMAP_PRIVATE_ANON);
+    x86_mov_ri(b, R8, (u64)-1);
+    x86_mov_ri(b, R9, 0);
     emit_syscall(b);
+    emit_store_data(b, DATA_OUTBUF, RAX);
+    x86_mov_ri(b, RCX, 0);
+    emit_store_data(b, DATA_OUTPOS, RCX);
+    x86_mov_ri(b, RCX, 4096);
+    emit_store_data(b, DATA_OUTLEN, RCX);
+    
+    /* Allocate traversal stack (64KB) */
+    x86_mov_ri(b, RAX, SYS_mmap);
+    x86_mov_ri(b, RDI, 0);
+    x86_mov_ri(b, RSI, 65536);
+    x86_mov_ri(b, RDX, MMAP_PROT_RW);
+    x86_mov_ri(b, R10, MMAP_PRIVATE_ANON);
+    x86_mov_ri(b, R8, (u64)-1);
+    x86_mov_ri(b, R9, 0);
+    emit_syscall(b);
+    
+    /* r8 = stack top (starts at end, grows down) */
+    x86_mov_rr(b, R8, RAX);
+    x86_add_ri(b, R8, 65536);
+    /* r9 = stack base */
+    x86_mov_rr(b, R9, RAX);
+    
+    /* Push root onto stack */
+    x86_sub_ri(b, R8, 8);
+    x86_mov_mr(b, R8, 0, R14);
+    
+    /* Main loop: while stack not empty */
+    u32 loop_start = x86_len(b);
+    
+    /* Check stack empty (r8 >= r9 + 65536) */
+    x86_mov_rr(b, RAX, R9);
+    x86_add_ri(b, RAX, 65536);
+    x86_cmp_rr(b, R8, RAX);
+    u32 loop_done_patch = x86_len(b) + 2;
+    x86_jae_rel(b, 0);  /* stack empty -> done */
+    
+    /* Pop closure into rcx, save to r10 */
+    x86_mov_rm(b, RCX, R8, 0);
+    x86_add_ri(b, R8, 8);
+    x86_mov_rr(b, R10, RCX);
+    
+    /* Get entry pointer to determine type */
+    x86_mov_rm(b, RDX, RCX, 0);
+    
+    /* Check for S */
+    emit_get_entry(b, RAX, CLOS_S);
+    x86_cmp_rr(b, RDX, RAX);
+    u32 is_s_patch = x86_len(b) + 2;
+    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
+    
+    /* Check for K */
+    emit_get_entry(b, RAX, CLOS_K);
+    x86_cmp_rr(b, RDX, RAX);
+    u32 is_k_patch = x86_len(b) + 2;
+    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
+    
+    /* Check for I */
+    emit_get_entry(b, RAX, CLOS_I);
+    x86_cmp_rr(b, RDX, RAX);
+    u32 is_i_patch = x86_len(b) + 2;
+    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
+    
+    /* Check for S1[x] */
+    emit_get_entry(b, RAX, CLOS_S1);
+    x86_cmp_rr(b, RDX, RAX);
+    u32 is_s1_patch = x86_len(b) + 2;
+    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
+    
+    /* Check for S2[x,y] */
+    emit_get_entry(b, RAX, CLOS_S2);
+    x86_cmp_rr(b, RDX, RAX);
+    u32 is_s2_patch = x86_len(b) + 2;
+    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
+    
+    /* Check for K1[x] */
+    emit_get_entry(b, RAX, CLOS_K1);
+    x86_cmp_rr(b, RDX, RAX);
+    u32 is_k1_patch = x86_len(b) + 2;
+    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
+    
+    /* Check for App[f,x] */
+    emit_get_entry(b, RAX, CLOS_APP);
+    x86_cmp_rr(b, RDX, RAX);
+    u32 is_app_patch = x86_len(b) + 2;
+    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
+    
+    /* Unknown type - trap */
+    x86_int3(b);
+    
+    /* is_s: emit 11111000 */
+    u32 is_s_target = x86_len(b);
+    x86_patch_rel32(b, is_s_patch, is_s_target);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
+    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
+    
+    /* is_k: emit 11100 */
+    u32 is_k_target = x86_len(b);
+    x86_patch_rel32(b, is_k_patch, is_k_target);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
+    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
+    
+    /* is_i: I = SKK = 1 + 1 + S + K + K = 1 + 1 + 11111000 + 11100 + 11100 */
+    u32 is_i_target = x86_len(b);
+    x86_patch_rel32(b, is_i_patch, is_i_target);
+    /* 1 (outer app) */
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    /* 1 (inner app) */
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    /* S = 11111000 */
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
+    /* K = 11100 */
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
+    /* K = 11100 */
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
+    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
+    
+    /* is_s1: S1[x] = App(S, x), emit 1, push x, push S-singleton */
+    u32 is_s1_target = x86_len(b);
+    x86_patch_rel32(b, is_s1_patch, is_s1_target);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    /* Push x = [r10+8] */
+    x86_mov_rm(b, RAX, R10, 8);
+    x86_sub_ri(b, R8, 8);
+    x86_mov_mr(b, R8, 0, RAX);
+    /* Push S singleton */
+    x86_lea(b, RAX, R15, DATA_PRIM_S);
+    x86_sub_ri(b, R8, 8);
+    x86_mov_mr(b, R8, 0, RAX);
+    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
+    
+    /* is_s2: S2[x,y] = App(App(S,x), y), emit 1, push y, then emit 1, S inline, push x */
+    u32 is_s2_target = x86_len(b);
+    x86_patch_rel32(b, is_s2_patch, is_s2_target);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    /* Push y = [r10+16] */
+    x86_mov_rm(b, RAX, R10, 16);
+    x86_sub_ri(b, R8, 8);
+    x86_mov_mr(b, R8, 0, RAX);
+    /* Push x */
+    x86_mov_rm(b, RAX, R10, 8);
+    x86_sub_ri(b, R8, 8);
+    x86_mov_mr(b, R8, 0, RAX);
+    /* Emit 1 for inner app, then S inline */
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    /* S = 11111000 */
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
+    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
+    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
+    
+    /* is_k1: K1[x] = App(K, x), emit 1, push x, push K-singleton */
+    u32 is_k1_target = x86_len(b);
+    x86_patch_rel32(b, is_k1_patch, is_k1_target);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    x86_mov_rm(b, RAX, R10, 8);
+    x86_sub_ri(b, R8, 8);
+    x86_mov_mr(b, R8, 0, RAX);
+    x86_lea(b, RAX, R15, DATA_PRIM_K);
+    x86_sub_ri(b, R8, 8);
+    x86_mov_mr(b, R8, 0, RAX);
+    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
+    
+    /* is_app: App[f,x], emit 1, push x, push f */
+    u32 is_app_target = x86_len(b);
+    x86_patch_rel32(b, is_app_patch, is_app_target);
+    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
+    /* Push x = [r10+16] first (will be popped second) */
+    x86_mov_rm(b, RAX, R10, 16);
+    x86_sub_ri(b, R8, 8);
+    x86_mov_mr(b, R8, 0, RAX);
+    /* Push f = [r10+8] (will be popped first) */
+    x86_mov_rm(b, RAX, R10, 8);
+    x86_sub_ri(b, R8, 8);
+    x86_mov_mr(b, R8, 0, RAX);
+    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
+    
+    /* loop_done: flush and exit */
+    u32 loop_done_target = x86_len(b);
+    x86_patch_rel32(b, loop_done_patch, loop_done_target);
+    emit_flush_and_exit(b);
 }
 
 /*
- * Jomplement Output Routine
- *
- * Jomplement = complement of Jot (0<->1 swapped)
+ * Jot Output - calls shared impl with XOR=0
+ */
+static void emit_output_jot(NativeEmit *e) {
+    emit_output_jot_impl(e);
+}
+
+/*
+ * Jomplement Output - calls shared impl with XOR=1 (set at init time)
  */
 static void emit_output_jomplement(NativeEmit *e) {
-    X86Buf *b = &e->code;
-    e->output_offset = x86_len(b);
-    
-    /* TODO: Implement Jomplement serialization */
-    /* For now, just exit - placeholder */
-    x86_mov_ri(b, RAX, SYS_exit);
-    x86_mov_ri(b, RDI, 0);
-    emit_syscall(b);
+    emit_output_jot_impl(e);
 }
 
 /*
@@ -1495,6 +1756,7 @@ NativeJIT *native_jit_prepare(NativeEmit *e, u32 heap_size) {
     data[DATA_LIMIT / 8] = (u64)jit->heap0 + heap_size;
     data[DATA_MAX_SPACE_SIZE / 8] = heap_size * 16;  /* Allow 16x growth */
     data[DATA_ALLOC_REQUEST / 8] = 0;
+    data[DATA_OUTPUT_XOR / 8] = (e->output_fmt == OUTPUT_JOMPLEMENT) ? 1 : 0;
     
     /* Set entry addresses in data section */
     for (int i = 0; i < CLOS_COUNT; i++) {
@@ -1779,6 +2041,9 @@ static u32 emit_elf_start(NativeEmit *e, u32 heap_size) {
     x86_mov_ri(b, RAX, 0);
     x86_mov_mr(b, R15, DATA_ACTIVE, RAX);
     x86_mov_mr(b, R15, DATA_ALLOC_REQUEST, RAX);
+    /* DATA_OUTPUT_XOR: 0 for BCL/Jot, 1 for Jomplement */
+    x86_mov_ri(b, RAX, (e->output_fmt == OUTPUT_JOMPLEMENT) ? 1 : 0);
+    x86_mov_mr(b, R15, DATA_OUTPUT_XOR, RAX);
     x86_mov_ri(b, RAX, heap_size);
     x86_mov_mr(b, R15, DATA_SPACE_SIZE, RAX);
     /* Max space size = heap_size * 16 (allow 16x growth) */

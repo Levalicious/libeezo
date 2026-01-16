@@ -100,8 +100,9 @@ static const int CLOS_PTRS[CLOS_COUNT] = {
 #define DATA_OUTLEN         80      /* u64: output buffer length */
 #define DATA_MAX_SPACE_SIZE 88      /* u64: max size per semispace (heap limit) */
 #define DATA_ALLOC_REQUEST  96      /* u64: bytes requested when GC triggered */
-#define DATA_ENTRY_TABLE    104     /* void*[CLOS_COUNT]: entry addresses */
-#define DATA_SIZE_TABLE     (104 + 8*CLOS_COUNT)  /* u8[CLOS_COUNT]: sizes */
+#define DATA_OUTPUT_XOR     104     /* u64: XOR mask for output bits (0=Jot, 1=Jomplement) */
+#define DATA_ENTRY_TABLE    112     /* void*[CLOS_COUNT]: entry addresses */
+#define DATA_SIZE_TABLE     (112 + 8*CLOS_COUNT)  /* u8[CLOS_COUNT]: sizes */
 #define DATA_PRIM_S         ((DATA_SIZE_TABLE + CLOS_COUNT + 7) & ~7)
 #define DATA_PRIM_K         (DATA_PRIM_S + 8)
 #define DATA_PRIM_I         (DATA_PRIM_K + 8)
