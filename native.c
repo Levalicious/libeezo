@@ -88,23 +88,41 @@ static void emit_get_singleton(X86Buf *b, X86Reg dst, ClosureType type) {
 /*
  * Emit: allocate n words on heap
  * Result (old hp) in RAX. Updates r12.
- * If allocation would overflow, jumps to gc_needed label.
+ * If allocation would overflow, stores request size and jumps to gc_needed label.
  * Caller must patch the gc_needed jump target.
  * Returns offset of the rel32 to patch.
  */
 static u32 emit_alloc(X86Buf *b, int words) {
+    int bytes = words * 8;
+    
     /* rax = r12 (old hp, will be return value) */
     x86_mov_rr(b, RAX, R12);
     
     /* r12 += words * 8 */
-    x86_add_ri(b, R12, words * 8);
+    x86_add_ri(b, R12, bytes);
     
     /* if r12 >= r13, need GC */
     x86_cmp_rr(b, R12, R13);
     
-    /* jae gc_needed (patch later) */
-    u32 patch_offset = x86_len(b) + 2;  /* after opcode bytes */
-    x86_jae_rel(b, 0);  /* placeholder */
+    /* jb alloc_ok (skip GC path) */
+    u32 ok_patch = x86_len(b) + 2;
+    x86_byte(b, 0x0F); x86_byte(b, 0x82); x86_dword(b, 0);
+    
+    /* GC needed - restore r12 and store allocation request */
+    x86_mov_rr(b, R12, RAX);  /* restore hp */
+    /* Store request size in DATA_ALLOC_REQUEST */
+    x86_push(b, RCX);
+    x86_mov_ri(b, RCX, bytes);
+    emit_store_data(b, DATA_ALLOC_REQUEST, RCX);
+    x86_pop(b, RCX);
+    
+    /* jmp gc_needed (patch later) */
+    u32 patch_offset = x86_len(b) + 1;  /* after opcode byte */
+    x86_jmp_rel(b, 0);  /* placeholder */
+    
+    /* alloc_ok: */
+    u32 ok_target = x86_len(b);
+    x86_patch_rel32(b, ok_patch, ok_target);
     
     return patch_offset;
 }
@@ -671,6 +689,111 @@ static void emit_gc(NativeEmit *e) {
     /* Loop done */
     u32 loop_done_target = x86_len(b);
     x86_patch_rel32(b, loop_done_patch, loop_done_target);
+    
+    /*
+     * GC complete. Check if we have enough space for pending allocation.
+     * DATA_ALLOC_REQUEST holds the bytes requested when GC was triggered.
+     * If hp + request > limit, need to grow heap.
+     */
+    emit_load_data(b, RAX, DATA_ALLOC_REQUEST);
+    x86_add_rr(b, RAX, R12);  /* rax = hp + request */
+    x86_cmp_rr(b, RAX, R13);  /* compare with limit */
+    u32 space_ok_patch = x86_len(b) + 2;
+    x86_byte(b, 0x0F); x86_byte(b, 0x86); x86_dword(b, 0);  /* jbe space_ok */
+    
+    /*
+     * Not enough space after GC - try to grow heap.
+     * New size = current_size * 2 (double it)
+     * Check against max_space_size
+     */
+    emit_load_data(b, RAX, DATA_SPACE_SIZE);
+    x86_byte(b, 0x48); x86_byte(b, 0xD1); x86_byte(b, 0xE0);  /* shl rax, 1 (double) */
+    
+    emit_load_data(b, RCX, DATA_MAX_SPACE_SIZE);
+    x86_cmp_rr(b, RAX, RCX);
+    u32 can_grow_patch = x86_len(b) + 2;
+    x86_byte(b, 0x0F); x86_byte(b, 0x86); x86_dword(b, 0);  /* jbe can_grow */
+    
+    /* Can't grow - OOM. Exit with code 137 (128 + SIGKILL-ish) */
+    x86_mov_ri(b, RAX, SYS_write);
+    x86_mov_ri(b, RDI, 2);  /* stderr */
+    /* We need an error message - use immediate bytes on stack */
+    /* Push "OOM\n" backwards */
+    x86_push(b, RAX);  /* make space */
+    x86_mov_ri(b, RAX, 0x0A4D4F4F);  /* "OOM\n" little-endian */
+    x86_mov_mr(b, RSP, 0, RAX);
+    x86_mov_rr(b, RSI, RSP);
+    x86_mov_ri(b, RDX, 4);
+    x86_mov_ri(b, RAX, SYS_write);
+    emit_syscall(b);
+    x86_mov_ri(b, RAX, SYS_exit);
+    x86_mov_ri(b, RDI, 137);
+    emit_syscall(b);
+    
+    /* can_grow: rax = new_size, allocate new spaces via mremap */
+    u32 can_grow_target = x86_len(b);
+    x86_patch_rel32(b, can_grow_patch, can_grow_target);
+    
+    /* Save new size in r8 */
+    x86_mov_rr(b, R8, RAX);
+    
+    /* mremap space0: mremap(old_addr, old_size, new_size, MREMAP_MAYMOVE) */
+    emit_load_data(b, RDI, DATA_SPACE0);
+    emit_load_data(b, RSI, DATA_SPACE_SIZE);
+    x86_mov_rr(b, RDX, R8);  /* new size */
+    x86_mov_ri(b, R10, 1);   /* MREMAP_MAYMOVE */
+    x86_mov_ri(b, RAX, 25);  /* SYS_mremap */
+    emit_syscall(b);
+    
+    /* Check for error (rax < 0 or MAP_FAILED) */
+    x86_cmp_ri(b, RAX, 0);
+    u32 mremap0_ok_patch = x86_len(b) + 2;
+    x86_byte(b, 0x0F); x86_byte(b, 0x8D); x86_dword(b, 0);  /* jge ok */
+    /* mremap failed - treat as OOM */
+    x86_mov_ri(b, RAX, SYS_exit);
+    x86_mov_ri(b, RDI, 137);
+    emit_syscall(b);
+    
+    u32 mremap0_ok_target = x86_len(b);
+    x86_patch_rel32(b, mremap0_ok_patch, mremap0_ok_target);
+    emit_store_data(b, DATA_SPACE0, RAX);
+    
+    /* mremap space1 */
+    emit_load_data(b, RDI, DATA_SPACE1);
+    emit_load_data(b, RSI, DATA_SPACE_SIZE);
+    x86_mov_rr(b, RDX, R8);
+    x86_mov_ri(b, R10, 1);
+    x86_mov_ri(b, RAX, 25);
+    emit_syscall(b);
+    
+    x86_cmp_ri(b, RAX, 0);
+    u32 mremap1_ok_patch = x86_len(b) + 2;
+    x86_byte(b, 0x0F); x86_byte(b, 0x8D); x86_dword(b, 0);
+    x86_mov_ri(b, RAX, SYS_exit);
+    x86_mov_ri(b, RDI, 137);
+    emit_syscall(b);
+    
+    u32 mremap1_ok_target = x86_len(b);
+    x86_patch_rel32(b, mremap1_ok_patch, mremap1_ok_target);
+    emit_store_data(b, DATA_SPACE1, RAX);
+    
+    /* Update space_size */
+    emit_store_data(b, DATA_SPACE_SIZE, R8);
+    
+    /* Update limit based on new active space */
+    emit_load_data(b, RAX, DATA_ACTIVE);
+    emit_load_data(b, RCX, DATA_SPACE0);
+    emit_load_data(b, RDX, DATA_SPACE1);
+    x86_cmp_ri(b, RAX, 0);
+    x86_mov_rr(b, R13, RCX);  /* assume active=0, use space0 */
+    /* cmovne r13, rdx */
+    x86_byte(b, 0x4C); x86_byte(b, 0x0F); x86_byte(b, 0x45); x86_byte(b, 0xEA);
+    x86_add_rr(b, R13, R8);  /* limit = base + new_size */
+    emit_store_data(b, DATA_LIMIT, R13);
+    
+    /* space_ok: */
+    u32 space_ok_target = x86_len(b);
+    x86_patch_rel32(b, space_ok_patch, space_ok_target);
     
     /* Restore registers */
     x86_pop(b, R15);
@@ -1370,6 +1493,8 @@ NativeJIT *native_jit_prepare(NativeEmit *e, u32 heap_size) {
     data[DATA_SPACE_SIZE / 8] = heap_size;
     data[DATA_HP / 8] = (u64)jit->heap0;
     data[DATA_LIMIT / 8] = (u64)jit->heap0 + heap_size;
+    data[DATA_MAX_SPACE_SIZE / 8] = heap_size * 16;  /* Allow 16x growth */
+    data[DATA_ALLOC_REQUEST / 8] = 0;
     
     /* Set entry addresses in data section */
     for (int i = 0; i < CLOS_COUNT; i++) {
@@ -1653,8 +1778,12 @@ static u32 emit_elf_start(NativeEmit *e, u32 heap_size) {
     /* Initialize other data fields */
     x86_mov_ri(b, RAX, 0);
     x86_mov_mr(b, R15, DATA_ACTIVE, RAX);
+    x86_mov_mr(b, R15, DATA_ALLOC_REQUEST, RAX);
     x86_mov_ri(b, RAX, heap_size);
     x86_mov_mr(b, R15, DATA_SPACE_SIZE, RAX);
+    /* Max space size = heap_size * 16 (allow 16x growth) */
+    x86_mov_ri(b, RAX, (u64)heap_size * 16);
+    x86_mov_mr(b, R15, DATA_MAX_SPACE_SIZE, RAX);
     
     /* Entry table is already in data section (baked in) */
     /* Singletons are already in data section (baked in) */
