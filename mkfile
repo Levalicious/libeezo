@@ -6,12 +6,16 @@ OFILES=\
 	term.$O\
 	bcl.$O\
 	jomplement.$O\
+	x86.$O\
+	native.$O\
 
 HFILES=\
 	types.h\
 	term.h\
 	bcl.h\
 	jomplement.h\
+	x86.h\
+	native.h\
 
 CFLAGS=-g -O2 -Wall -I.
 
