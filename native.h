@@ -35,6 +35,9 @@ typedef enum {
     CLOS_NORM,      /* Norm[k] - receives a WHNF, normalizes its captured args, passes NF to k */
     CLOS_FIELD1,    /* Field1[v, k] - receives nf(v.x), stores it in place, continues */
     CLOS_FIELD2,    /* Field2[v, k] - receives nf(v.y), stores it in place, k(v) */
+    CLOS_IOV,       /* IoV - stream I/O: receives the output cell (WHNF), asks for its head */
+    CLOS_IOH,       /* IoH[v] - receives the head, applies it to the markers K and S */
+    CLOS_ION,       /* IoN[v, count] - unfolds the K1 spine; on S emits the byte, moves to the tail */
     CLOS_HALT,      /* Halt continuation - jumps to output routine */
     CLOS_FWD,       /* Forwarding pointer (during GC) */
     CLOS_COUNT
@@ -67,6 +70,9 @@ static const int CLOS_SIZES[CLOS_COUNT] = {
     2,  /* NORM: entry + k */
     3,  /* FIELD1: entry + v + k */
     3,  /* FIELD2: entry + v + k */
+    1,  /* IOV */
+    2,  /* IOH: entry + v */
+    3,  /* ION: entry + v + count (an unboxed small integer; the collector leaves it alone) */
     1,  /* HALT */
     2,  /* FWD: entry + target */
 };
@@ -86,6 +92,9 @@ static const int CLOS_PTRS[CLOS_COUNT] = {
     1,  /* NORM */
     2,  /* FIELD1 */
     2,  /* FIELD2 */
+    0,  /* IOV */
+    1,  /* IOH */
+    2,  /* ION (count is outside every semispace, so copy_closure returns it unchanged) */
     0,  /* HALT */
     1,  /* FWD */
 };
@@ -123,8 +132,16 @@ static const int CLOS_PTRS[CLOS_COUNT] = {
 #define DATA_FROM_END       168
 #define DATA_STATIC_BEGIN   176     /* void*: static closure area (ELF: the embedded term) - scanned as roots */
 #define DATA_STATIC_END     184
-#define DATA_ENTRY_TABLE    192     /* void*[CLOS_COUNT]: entry addresses */
-#define DATA_SIZE_TABLE     (192 + 8*CLOS_COUNT)  /* u8[CLOS_COUNT]: sizes */
+#define DATA_IO_MODE        192     /* u64: 1 = stream I/O mode (Lazy-K), 0 = term output */
+#define DATA_STATIC2_BEGIN  200     /* void*: second static root area: the input stream (io mode) */
+#define DATA_STATIC2_END    208
+#define DATA_IO_BUF         216     /* void*: raw stdin bytes (io mode) */
+#define DATA_IO_LEN         224     /* u64: their count */
+#define DATA_IO_CHAIN       232     /* void*: numeral chain base: num[k] = chain + (k-1)*24, num[0] = K I */
+#define DATA_IOV            240     /* IoV continuation singleton (1 word) */
+#define DATA_KI             248     /* K I as a static closure: [entry_K1, prim_I] (2 words) */
+#define DATA_ENTRY_TABLE    264     /* void*[CLOS_COUNT]: entry addresses */
+#define DATA_SIZE_TABLE     (264 + 8*CLOS_COUNT)  /* u8[CLOS_COUNT]: sizes */
 #define DATA_PRIM_S         ((DATA_SIZE_TABLE + CLOS_COUNT + 7) & ~7)
 #define DATA_PRIM_K         (DATA_PRIM_S + 8)
 #define DATA_PRIM_I         (DATA_PRIM_K + 8)
@@ -158,6 +175,9 @@ typedef struct {
     int n_gc_call;
     /* Normalization mode baked into the data section: 1 = NF (default), 0 = WHNF */
     int nf_mode;
+    /* Stream I/O mode (Lazy-K): read stdin into an input stream, drive the
+     * program as a stream transformer, write bytes. Replaces term output. */
+    int io_mode;
     u32 output_offset;      /* output serialization routine */
     u32 start_offset;       /* program entry point */
     
