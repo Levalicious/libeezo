@@ -100,6 +100,7 @@ static void emit_get_singleton(X86Buf *b, X86Reg dst, ClosureType type) {
 #define CC_BE  0x86
 #define CC_A   0x87
 #define CC_GE  0x8D
+#define CC_L   0x8C
 static u32 emit_jcc(X86Buf *b, u8 cc) {
     x86_byte(b, 0x0F); x86_byte(b, cc);
     u32 p = x86_len(b);
@@ -701,6 +702,13 @@ static void emit_gc(NativeEmit *e) {
     x86_call_rel(b, 0); u32 sv1 = x86_len(b) - 4;
     emit_jmp_back(b, sscan);
     x86_patch_rel32(b, sscan_done, x86_len(b));
+    emit_load_data(b, RBX, DATA_STATIC2_BEGIN);
+    u32 s2 = x86_len(b);
+    x86_cmp_rm(b, RBX, R15, DATA_STATIC2_END);
+    u32 s2_done = emit_jcc(b, CC_AE);
+    x86_call_rel(b, 0); u32 sv3 = x86_len(b) - 4;
+    emit_jmp_back(b, s2);
+    x86_patch_rel32(b, s2_done, x86_len(b));
     /* Cheney scan: rbx = scan pointer, chases hp */
     emit_load_data(b, RBX, DATA_SCAN);
     u32 scan = x86_len(b);
@@ -774,6 +782,341 @@ static void emit_gc(NativeEmit *e) {
     for (int i = 0; i < 3; i++) x86_patch_rel32(b, rc[i], e->gc_copy_offset);
     x86_patch_rel32(b, sv1, e->gc_scavenge_offset);
     x86_patch_rel32(b, sv2, e->gc_scavenge_offset);
+    x86_patch_rel32(b, sv3, e->gc_scavenge_offset);
+}
+
+
+/* ========================================================================
+ * STREAM I/O - the Lazy-K / WHNF model (see eezo/io.h)
+ *
+ * The program is a function from the input stream to the output stream.
+ * Streams are pairs  f -> f x rest  = S (S I (K x)) (K rest), elements are
+ * Church numerals, the input ends in an infinite stream of 256, an output
+ * element n >= 256 exits with status n - 256.
+ *
+ * The driver is three continuations, all pure:
+ *   IoV        receives the output cell v (WHNF)  -> apply v to K       (head)
+ *   IoH[v]     receives the head h                -> apply h to K, then S
+ *   IoN[v, c]  receives t: K1[u] -> c+1, unfold u; S -> the numeral is c:
+ *              emit the byte (or exit), then apply v to K I for the tail,
+ *              whose value goes back to IoV.
+ * Reading a numeral never needs a normal form: n K S = K (K (... S)) and
+ * each step is one weak head reduction.
+ *
+ * The input stream is built by emitted code at start-up (both JIT and
+ * ELF) into a separate mmap'd region that the collector scans as a second
+ * static root area; its cells are thunks and get updated like any other.
+ * ======================================================================== */
+
+/* write(1, OUTBUF, OUTPOS); OUTPOS = 0. Clobbers RAX, RCX, RDX, RSI, RDI, R11. */
+static void emit_io_flush(X86Buf *b) {
+    emit_load_data(b, RDX, DATA_OUTPOS);
+    x86_cmp_ri(b, RDX, 0);
+    u32 skip = emit_jcc(b, CC_E);
+    x86_mov_ri(b, RAX, SYS_write);
+    x86_mov_ri(b, RDI, 1);
+    emit_load_data(b, RSI, DATA_OUTBUF);
+    emit_syscall(b);
+    x86_mov_ri(b, RCX, 0);
+    emit_store_data(b, DATA_OUTPOS, RCX);
+    x86_patch_rel32(b, skip, x86_len(b));
+}
+
+/* Byte in RDI -> output buffer, flushing when full. Preserves RBX, R14. */
+static void emit_output_byte(X86Buf *b) {
+    emit_load_data(b, RAX, DATA_OUTBUF);
+    emit_load_data(b, RCX, DATA_OUTPOS);
+    x86_mov_rr(b, RDX, RDI);
+    x86_byte(b, 0x88); x86_byte(b, 0x14); x86_byte(b, 0x08);   /* mov [rax+rcx], dl */
+    x86_add_ri(b, RCX, 1);
+    emit_store_data(b, DATA_OUTPOS, RCX);
+    emit_load_data(b, RDX, DATA_OUTLEN);
+    x86_cmp_rr(b, RCX, RDX);
+    u32 skip = emit_jcc(b, CC_B);
+    emit_io_flush(b);
+    x86_patch_rel32(b, skip, x86_len(b));
+}
+
+/* Write a 16-byte message (two little-endian qwords) to stderr, exit(code) */
+static void emit_die(X86Buf *b, u64 w0, u64 w1, int code) {
+    x86_mov_ri(b, RAX, w1); x86_push(b, RAX);
+    x86_mov_ri(b, RAX, w0); x86_push(b, RAX);
+    x86_mov_ri(b, RAX, SYS_write);
+    x86_mov_ri(b, RDI, 2);
+    x86_mov_rr(b, RSI, RSP);
+    x86_mov_ri(b, RDX, 16);
+    emit_syscall(b);
+    x86_mov_ri(b, RAX, SYS_exit);
+    x86_mov_ri(b, RDI, code);
+    emit_syscall(b);
+}
+#define MSG_NOT_NUMERAL_0 0x20746f6e203a6f69ULL
+#define MSG_NOT_NUMERAL_1 0x0a6c6172656d756eULL
+#define MSG_READ_FAILED_0 0x64616572203a6f69ULL
+#define MSG_READ_FAILED_1 0x0a64656c69616620ULL
+
+/* IoV: receives the output cell v -> eval(v K, IoH[v]) */
+static void emit_entry_IoV(NativeEmit *e) {
+    X86Buf *b = &e->code;
+    u32 top = x86_len(b);
+    e->entry_offsets[CLOS_IOV] = top;
+    emit_reserve(e, 5, top);
+    emit_bump(b, 2);                                   /* IoH[v] */
+    emit_get_entry(b, RSI, CLOS_IOH);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, R14);
+    x86_mov_rr(b, R8, RAX);
+    emit_bump(b, 3);                                   /* ApplyK[K, IoH] */
+    emit_get_entry(b, RSI, CLOS_APPLYK);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_lea(b, RCX, R15, DATA_PRIM_K);
+    x86_mov_mr(b, RAX, 8, RCX);
+    x86_mov_mr(b, RAX, 16, R8);
+    x86_mov_rr(b, RBX, RAX);
+    emit_call_cont(b);                                 /* f_val = v (r14) */
+}
+
+/* IoH[v]: receives the head h -> eval(h K S, IoN[v, 0]) */
+static void emit_entry_IoH(NativeEmit *e) {
+    X86Buf *b = &e->code;
+    u32 top = x86_len(b);
+    e->entry_offsets[CLOS_IOH] = top;
+    emit_reserve(e, 9, top);
+    x86_mov_rm(b, RCX, RDI, 8);                        /* v */
+    emit_bump(b, 3);                                   /* IoN[v, 0] */
+    emit_get_entry(b, RSI, CLOS_ION);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, RCX);
+    x86_mov_mi(b, RAX, 16, 0);
+    x86_mov_rr(b, R8, RAX);
+    emit_bump(b, 3);                                   /* ApplyK[S, IoN] */
+    emit_get_entry(b, RSI, CLOS_APPLYK);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_lea(b, RCX, R15, DATA_PRIM_S);
+    x86_mov_mr(b, RAX, 8, RCX);
+    x86_mov_mr(b, RAX, 16, R8);
+    x86_mov_rr(b, R9, RAX);
+    emit_bump(b, 3);                                   /* ApplyK[K, that] */
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_lea(b, RCX, R15, DATA_PRIM_K);
+    x86_mov_mr(b, RAX, 8, RCX);
+    x86_mov_mr(b, RAX, 16, R9);
+    x86_mov_rr(b, RBX, RAX);
+    emit_call_cont(b);                                 /* f_val = h (r14) */
+}
+
+/* IoN[v, count]: receives t */
+static void emit_entry_IoN(NativeEmit *e) {
+    X86Buf *b = &e->code;
+    u32 top = x86_len(b);
+    e->entry_offsets[CLOS_ION] = top;
+    emit_reserve(e, 3, top);
+    x86_mov_rm(b, RSI, R14, 0);
+    emit_get_entry(b, R8, CLOS_K1);
+    x86_cmp_rr(b, RSI, R8);
+    u32 more = emit_jcc(b, CC_E);
+    emit_get_entry(b, R8, CLOS_S);
+    x86_cmp_rr(b, RSI, R8);
+    u32 done = emit_jcc(b, CC_E);
+    emit_io_flush(b);
+    emit_die(b, MSG_NOT_NUMERAL_0, MSG_NOT_NUMERAL_1, 1);
+    /* K1[u]: count++, unfold u under the same continuation */
+    x86_patch_rel32(b, more, x86_len(b));
+    x86_mov_rm(b, RAX, RDI, 16);
+    x86_add_ri(b, RAX, 1);
+    x86_mov_mr(b, RDI, 16, RAX);
+    x86_mov_rr(b, RBX, RDI);
+    x86_mov_rm(b, RDI, R14, 8);
+    emit_enter(b);
+    /* S: the numeral is count */
+    x86_patch_rel32(b, done, x86_len(b));
+    x86_mov_rr(b, RBX, RDI);                           /* self, safe across syscalls */
+    x86_mov_rm(b, RCX, RDI, 16);
+    x86_cmp_ri(b, RCX, 256);
+    u32 fin = emit_jcc(b, CC_AE);
+    x86_mov_rr(b, RDI, RCX);
+    emit_output_byte(b);
+    x86_mov_rm(b, RCX, RBX, 8);                        /* v */
+    emit_bump(b, 3);                                   /* ApplyK[K I, IoV]: the tail's value returns to IoV */
+    emit_get_entry(b, RSI, CLOS_APPLYK);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_lea(b, RDX, R15, DATA_KI);
+    x86_mov_mr(b, RAX, 8, RDX);
+    x86_lea(b, RDX, R15, DATA_IOV);
+    x86_mov_mr(b, RAX, 16, RDX);
+    x86_mov_rr(b, RBX, RAX);
+    x86_mov_rr(b, R14, RCX);
+    emit_call_cont(b);
+    /* count >= 256: flush, exit(count - 256) */
+    x86_patch_rel32(b, fin, x86_len(b));
+    x86_push(b, RCX);
+    emit_io_flush(b);
+    x86_pop(b, RDI);
+    x86_sub_ri(b, RDI, 256);
+    x86_mov_ri(b, RAX, SYS_exit);
+    emit_syscall(b);
+}
+
+/* mmap(NULL, RSI bytes, RW, private|anon) -> RAX. Clobbers RDI, RDX, R8-R11. */
+static void emit_mmap_rsi(X86Buf *b) {
+    x86_mov_ri(b, RAX, SYS_mmap);
+    x86_mov_ri(b, RDI, 0);
+    x86_mov_ri(b, RDX, MMAP_PROT_RW);
+    x86_mov_ri(b, R10, MMAP_PRIVATE_ANON);
+    x86_mov_ri(b, R8, (u64)-1);
+    x86_mov_ri(b, R9, 0);
+    emit_syscall(b);
+}
+
+/* Write an App cell [entry_App, f, x] at the bump pointer R9; RAX = its address. Clobbers RSI. */
+static void emit_io_cell(X86Buf *b, X86Reg f, X86Reg x) {
+    x86_mov_rr(b, RAX, R9);
+    emit_get_entry(b, RSI, CLOS_APP);
+    x86_mov_mr(b, R9, 0, RSI);
+    x86_mov_mr(b, R9, 8, f);
+    x86_mov_mr(b, R9, 16, x);
+    x86_add_ri(b, R9, 24);
+}
+
+/*
+ * io start: entered from _start with r12/r13/r15 set up.
+ *   1. output buffer
+ *   2. read all of stdin (rbx = buf, rbp = len, r14 = cap)
+ *   3. mmap the input region: (15*len + 801) words
+ *   4. build: succ, the numeral chain, S I, the EOF cycle, the cells, App(P, s)
+ *   5. enter App(P, s) with continuation IoV
+ */
+static void emit_io_start(NativeEmit *e) {
+    X86Buf *b = &e->code;
+    /* 1 */
+    x86_mov_ri(b, RSI, 4096);
+    emit_mmap_rsi(b);
+    emit_store_data(b, DATA_OUTBUF, RAX);
+    x86_mov_ri(b, RAX, 4096);
+    emit_store_data(b, DATA_OUTLEN, RAX);
+    x86_mov_ri(b, RAX, 0);
+    emit_store_data(b, DATA_OUTPOS, RAX);
+    /* 2 */
+    x86_mov_ri(b, R14, 65536);
+    x86_mov_rr(b, RSI, R14);
+    emit_mmap_rsi(b);
+    x86_mov_rr(b, RBX, RAX);
+    x86_mov_ri(b, RBP, 0);
+    u32 rd = x86_len(b);
+    x86_mov_ri(b, RAX, 0);                             /* SYS_read */
+    x86_mov_ri(b, RDI, 0);
+    x86_mov_rr(b, RSI, RBX); x86_add_rr(b, RSI, RBP);
+    x86_mov_rr(b, RDX, R14); x86_byte(b, 0x48); x86_byte(b, 0x29); x86_byte(b, 0xEA);   /* sub rdx, rbp */
+    emit_syscall(b);
+    x86_cmp_ri(b, RAX, 0);
+    u32 rd_err = emit_jcc(b, CC_L);
+    u32 rd_done = emit_jcc(b, CC_E);
+    x86_add_rr(b, RBP, RAX);
+    x86_cmp_rr(b, RBP, R14);
+    u32 rd_again = emit_jcc(b, CC_B);
+    /* buffer full: double it (bytes only, moving is fine) */
+    x86_mov_rr(b, RDI, RBX);
+    x86_mov_rr(b, RSI, R14);
+    x86_mov_rr(b, RDX, R14); x86_add_rr(b, RDX, R14);
+    x86_mov_ri(b, R10, 1);
+    x86_mov_ri(b, RAX, SYS_mremap);
+    emit_syscall(b);
+    x86_cmp_ri(b, RAX, 0);
+    u32 rd_err2 = emit_jcc(b, CC_L);
+    x86_mov_rr(b, RBX, RAX);
+    x86_mov_rr(b, R14, RDX);
+    x86_patch_rel32(b, rd_again, x86_len(b));
+    emit_jmp_back(b, rd);
+    x86_patch_rel32(b, rd_err, x86_len(b));
+    x86_patch_rel32(b, rd_err2, x86_len(b));
+    emit_die(b, MSG_READ_FAILED_0, MSG_READ_FAILED_1, 1);
+    x86_patch_rel32(b, rd_done, x86_len(b));
+    emit_store_data(b, DATA_IO_BUF, RBX);
+    emit_store_data(b, DATA_IO_LEN, RBP);
+    /* 3: bytes = (15*len + 801) * 8 */
+    x86_mov_rr(b, RAX, RBP);
+    x86_byte(b, 0x48); x86_byte(b, 0xC1); x86_byte(b, 0xE0); x86_byte(b, 4);       /* shl rax, 4 */
+    x86_byte(b, 0x48); x86_byte(b, 0x29); x86_byte(b, 0xE8);                        /* sub rax, rbp */
+    x86_add_ri(b, RAX, 801);
+    x86_byte(b, 0x48); x86_byte(b, 0xC1); x86_byte(b, 0xE0); x86_byte(b, 3);       /* shl rax, 3 */
+    x86_mov_rr(b, RSI, RAX);
+    emit_mmap_rsi(b);
+    emit_store_data(b, DATA_STATIC2_BEGIN, RAX);
+    x86_mov_rr(b, R9, RAX);                            /* bump pointer */
+    /* the cons subroutine: r10 = x, r11 = y -> rax = S (S I (K x)) (K y); r14 = S I.
+     * Uses rax, rcx, rdx, rsi, r8; preserves rdi, r10, r11. */
+    x86_jmp_rel(b, 0);
+    u32 over = x86_len(b) - 4;
+    u32 cons = x86_len(b);
+    x86_mov_rr(b, RDX, R11);
+    x86_lea(b, RCX, R15, DATA_PRIM_K); emit_io_cell(b, RCX, R10); x86_mov_rr(b, R8, RAX);   /* K x */
+    emit_io_cell(b, R14, R8);          x86_mov_rr(b, R8, RAX);                              /* S I (K x) */
+    x86_lea(b, RCX, R15, DATA_PRIM_S); emit_io_cell(b, RCX, R8);  x86_mov_rr(b, R8, RAX);   /* S (..) */
+    x86_lea(b, RCX, R15, DATA_PRIM_K); emit_io_cell(b, RCX, RDX); x86_mov_rr(b, RCX, RAX);  /* K y */
+    emit_io_cell(b, R8, RCX);                                                               /* the cell */
+    x86_ret(b);
+    x86_patch_rel32(b, over, x86_len(b));
+    /* 4: succ = S (S (K S) K) */
+    x86_lea(b, R10, R15, DATA_PRIM_K); x86_lea(b, R11, R15, DATA_PRIM_S); emit_io_cell(b, R10, R11);
+    x86_lea(b, R10, R15, DATA_PRIM_S); x86_mov_rr(b, R11, RAX);           emit_io_cell(b, R10, R11);
+    x86_mov_rr(b, R10, RAX);           x86_lea(b, R11, R15, DATA_PRIM_K); emit_io_cell(b, R10, R11);
+    x86_lea(b, R10, R15, DATA_PRIM_S); x86_mov_rr(b, R11, RAX);           emit_io_cell(b, R10, R11);
+    x86_mov_rr(b, R14, RAX);                           /* succ */
+    /* chain: num[k] = succ num[k-1], k = 1..256, contiguous */
+    emit_store_data(b, DATA_IO_CHAIN, R9);
+    x86_lea(b, R11, R15, DATA_KI);
+    x86_mov_ri(b, RCX, 256);
+    u32 ch = x86_len(b);
+    x86_push(b, RCX);
+    emit_io_cell(b, R14, R11);
+    x86_pop(b, RCX);
+    x86_mov_rr(b, R11, RAX);
+    x86_sub_ri(b, RCX, 1);
+    x86_cmp_ri(b, RCX, 0);
+    u32 ch_done = emit_jcc(b, CC_E);
+    emit_jmp_back(b, ch);
+    x86_patch_rel32(b, ch_done, x86_len(b));
+    /* S I */
+    x86_lea(b, R10, R15, DATA_PRIM_S); x86_lea(b, R11, R15, DATA_PRIM_I); emit_io_cell(b, R10, R11);
+    x86_mov_rr(b, R14, RAX);
+    /* EOF cycle: cons(num[256], itself); the cell is the 5th one written */
+    emit_load_data(b, R10, DATA_IO_CHAIN); x86_add_ri(b, R10, 255 * 24);
+    x86_lea(b, R11, R9, 96);
+    x86_call_rel(b, 0); u32 c1 = x86_len(b) - 4;
+    x86_mov_rr(b, RDI, RAX);                           /* s */
+    /* the bytes, back to front: rbp counts down */
+    u32 bl = x86_len(b);
+    x86_cmp_ri(b, RBP, 0);
+    u32 bl_done = emit_jcc(b, CC_E);
+    x86_sub_ri(b, RBP, 1);
+    x86_byte(b, 0x48); x86_byte(b, 0x0F); x86_byte(b, 0xB6); x86_byte(b, 0x04); x86_byte(b, 0x2B);   /* movzx rax, byte [rbx+rbp] */
+    x86_cmp_ri(b, RAX, 0);
+    u32 nz = emit_jcc(b, CC_NE);
+    x86_lea(b, R10, R15, DATA_KI);
+    x86_jmp_rel(b, 0); u32 have = x86_len(b) - 4;
+    x86_patch_rel32(b, nz, x86_len(b));
+    x86_sub_ri(b, RAX, 1);
+    x86_byte(b, 0x48); x86_byte(b, 0xC1); x86_byte(b, 0xE0); x86_byte(b, 3);       /* shl rax, 3 */
+    x86_byte(b, 0x48); x86_byte(b, 0x8D); x86_byte(b, 0x0C); x86_byte(b, 0x40);    /* lea rcx, [rax+rax*2] */
+    emit_load_data(b, R10, DATA_IO_CHAIN);
+    x86_add_rr(b, R10, RCX);
+    x86_patch_rel32(b, have, x86_len(b));
+    x86_mov_rr(b, R11, RDI);
+    x86_call_rel(b, 0); u32 c2 = x86_len(b) - 4;
+    x86_mov_rr(b, RDI, RAX);
+    emit_jmp_back(b, bl);
+    x86_patch_rel32(b, bl_done, x86_len(b));
+    x86_patch_rel32(b, c1, cons);
+    x86_patch_rel32(b, c2, cons);
+    /* App(P, s) */
+    emit_load_data(b, R10, DATA_ROOT);
+    emit_io_cell(b, R10, RDI);
+    emit_store_data(b, DATA_STATIC2_END, R9);
+    /* 5 */
+    x86_lea(b, RBX, R15, DATA_IOV);
+    x86_mov_rr(b, RDI, RAX);
+    x86_mov_ri(b, R14, 0);
+    emit_enter(b);
 }
 
 /* ========================================================================
@@ -799,6 +1142,9 @@ static void emit_start(NativeEmit *e) {
     /* Load runtime state into registers */
     emit_load_data(b, R12, DATA_HP);
     emit_load_data(b, R13, DATA_LIMIT);
+    emit_load_data(b, RAX, DATA_IO_MODE);
+    x86_cmp_ri(b, RAX, 0);
+    u32 io = emit_jcc(b, CC_NE);
     x86_mov_ri(b, R14, 0);                      /* no value yet: the GC root must be clean */
     x86_lea(b, RBX, R15, DATA_HALT);            /* k = Halt */
     emit_load_data(b, RDI, DATA_ROOT);          /* the program */
@@ -815,6 +1161,9 @@ static void emit_start(NativeEmit *e) {
     x86_mov_rr(b, RBX, RAX);
     x86_patch_rel32(b, whnf, x86_len(b));
     emit_enter(b);
+    /* stream I/O mode */
+    x86_patch_rel32(b, io, x86_len(b));
+    emit_io_start(e);
 }
 
 /* ========================================================================
@@ -1498,6 +1847,9 @@ void native_emit_runtime(NativeEmit *e) {
     emit_entry_Norm(e);
     emit_entry_Field1(e);
     emit_entry_Field2(e);
+    emit_entry_IoV(e);
+    emit_entry_IoH(e);
+    emit_entry_IoN(e);
     emit_entry_Halt(e);
     emit_entry_Fwd(e);
     /* Collector (classify + copy_closure + gc) */
@@ -1577,6 +1929,12 @@ NativeJIT *native_jit_prepare(NativeEmit *e, u32 heap_size) {
     data[DATA_NF_MODE / 8] = e->nf_mode ? 1 : 0;
     data[DATA_STATIC_BEGIN / 8] = 0;
     data[DATA_STATIC_END / 8] = 0;
+    data[DATA_IO_MODE / 8] = e->io_mode ? 1 : 0;
+    data[DATA_STATIC2_BEGIN / 8] = 0;
+    data[DATA_STATIC2_END / 8] = 0;
+    data[DATA_IOV / 8] = (u64)jit->code + e->entry_offsets[CLOS_IOV];
+    data[DATA_KI / 8] = (u64)jit->code + e->entry_offsets[CLOS_K1];
+    data[DATA_KI / 8 + 1] = (u64)jit->data + DATA_PRIM_I;
     data[DATA_HP / 8] = (u64)jit->heap0;
     data[DATA_LIMIT / 8] = (u64)jit->heap0 + heap_size;
     data[DATA_MAX_SPACE_SIZE / 8] = heap_size * 16;  /* Allow 16x growth */
@@ -1739,6 +2097,9 @@ int native_jit_run(NativeJIT *jit) {
     }
     
     /* Child terminated abnormally */
+    if (WIFSIGNALED(status)) {
+        return 128 + WTERMSIG(status);   /* the shell convention, as the ELF would show */
+    }
     return -1;
 }
 
@@ -1875,6 +2236,8 @@ static u32 emit_elf_start(NativeEmit *e, u32 heap_size) {
     x86_mov_mr(b, R15, DATA_SPACE1_SIZE, RAX);
     x86_mov_ri(b, RAX, e->nf_mode ? 1 : 0);
     x86_mov_mr(b, R15, DATA_NF_MODE, RAX);
+    x86_mov_ri(b, RAX, e->io_mode ? 1 : 0);
+    x86_mov_mr(b, R15, DATA_IO_MODE, RAX);
     /* Max space size = heap_size * 16 (allow 16x growth) */
     x86_mov_ri(b, RAX, (u64)heap_size * 16);
     x86_mov_mr(b, R15, DATA_MAX_SPACE_SIZE, RAX);
@@ -2049,6 +2412,9 @@ void native_emit_elf(NativeEmit *e, u8 **out, u32 *out_size, SKITerm *term, u32 
     d[DATA_ROOT / 8] = root_vaddr;
     d[DATA_STATIC_BEGIN / 8] = term_buf_vaddr;
     d[DATA_STATIC_END / 8] = term_buf_vaddr + term_hp;
+    d[DATA_IOV / 8] = code_vaddr + e->entry_offsets[CLOS_IOV];
+    d[DATA_KI / 8] = code_vaddr + e->entry_offsets[CLOS_K1];
+    d[DATA_KI / 8 + 1] = data_vaddr + DATA_PRIM_I;
     
     /* Calculate total file size */
     u32 total_size = header_size + code_size + data_size;
