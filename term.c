@@ -301,11 +301,25 @@ static bool reduce_step(SKIPool *p, SKITerm **tp) {
     return false;
 }
 
-i64 ski_reduce(SKIPool *p, SKITerm **t, u64 max_steps) {
+/*
+ * Find the head redex only: walk the left spine, outermost first.
+ * Stops at weak head normal form (a combinator with too few args);
+ * arguments are never entered.
+ */
+static SKITerm **find_head_redex(SKITerm **tp) {
+    SKITerm **cur = tp;
+    while (*cur && (*cur)->tag == TERM_APP) {
+        if (is_redex(*cur)) return cur;
+        cur = &(*cur)->app.left;
+    }
+    return NULL;
+}
+
+i64 ski_reduce_mode(SKIPool *p, SKITerm **t, u64 max_steps, bool whnf) {
     i64 steps = 0;
     
     while (max_steps == 0 || (u64)steps < max_steps) {
-        SKITerm **redex = find_redex(t);
+        SKITerm **redex = whnf ? find_head_redex(t) : find_redex(t);
         if (!redex) break;
         
         if (!reduce_step(p, redex)) {
@@ -317,8 +331,16 @@ i64 ski_reduce(SKIPool *p, SKITerm **t, u64 max_steps) {
     return steps;
 }
 
-bool ski_is_hnf(SKITerm *t) {
+i64 ski_reduce(SKIPool *p, SKITerm **t, u64 max_steps) {
+    return ski_reduce_mode(p, t, max_steps, false);
+}
+
+bool ski_is_nf(SKITerm *t) {
     return find_redex(&t) == NULL;
+}
+
+bool ski_is_whnf(SKITerm *t) {
+    return find_head_redex(&t) == NULL;
 }
 
 /*
