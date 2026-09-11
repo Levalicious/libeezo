@@ -28,9 +28,13 @@ typedef enum {
     CLOS_S1,        /* S x - partial application */
     CLOS_S2,        /* S x y - partial application */
     CLOS_K1,        /* K x - partial application */
-    CLOS_APP,       /* (f x) - application node (term) */
-    CLOS_APPLYK1,   /* ApplyK1[x_term, k] - waiting for f_val */
-    CLOS_APPLYK2,   /* ApplyK2[f_val, k] - waiting for x_val */
+    CLOS_APP,       /* App[f, x] - application THUNK (not a value) */
+    CLOS_IND,       /* Ind[v] - an updated thunk: enter v */
+    CLOS_APPLYK,    /* ApplyK[x, k] - waiting for f_val; applies it to the UNEVALUATED x */
+    CLOS_UPDK,      /* UpdK[thunk, k] - overwrite thunk with Ind[value], pass value to k */
+    CLOS_NORM,      /* Norm[k] - receives a WHNF, normalizes its captured args, passes NF to k */
+    CLOS_FIELD1,    /* Field1[v, k] - receives nf(v.x), stores it in place, continues */
+    CLOS_FIELD2,    /* Field2[v, k] - receives nf(v.y), stores it in place, k(v) */
     CLOS_HALT,      /* Halt continuation - jumps to output routine */
     CLOS_FWD,       /* Forwarding pointer (during GC) */
     CLOS_COUNT
@@ -57,8 +61,12 @@ static const int CLOS_SIZES[CLOS_COUNT] = {
     3,  /* S2: entry + x + y */
     2,  /* K1: entry + x */
     3,  /* APP: entry + f + x */
-    3,  /* APPLYK1: entry + x_term + k */
-    3,  /* APPLYK2: entry + f_val + k */
+    3,  /* IND: entry + value + unused (same cell as the App it replaced, so static term areas stay linearly scannable) */
+    3,  /* APPLYK: entry + x + k */
+    3,  /* UPDK: entry + thunk + k */
+    2,  /* NORM: entry + k */
+    3,  /* FIELD1: entry + v + k */
+    3,  /* FIELD2: entry + v + k */
     1,  /* HALT */
     2,  /* FWD: entry + target */
 };
@@ -72,8 +80,12 @@ static const int CLOS_PTRS[CLOS_COUNT] = {
     2,  /* S2 */
     1,  /* K1 */
     2,  /* APP */
-    2,  /* APPLYK1 */
-    2,  /* APPLYK2 */
+    1,  /* IND */
+    2,  /* APPLYK */
+    2,  /* UPDK */
+    1,  /* NORM */
+    2,  /* FIELD1 */
+    2,  /* FIELD2 */
     0,  /* HALT */
     1,  /* FWD */
 };
@@ -101,8 +113,18 @@ static const int CLOS_PTRS[CLOS_COUNT] = {
 #define DATA_MAX_SPACE_SIZE 88      /* u64: max size per semispace (heap limit) */
 #define DATA_ALLOC_REQUEST  96      /* u64: bytes requested when GC triggered */
 #define DATA_OUTPUT_XOR     104     /* u64: XOR mask for output bits (0=Jot, 1=Jomplement) */
-#define DATA_ENTRY_TABLE    112     /* void*[CLOS_COUNT]: entry addresses */
-#define DATA_SIZE_TABLE     (112 + 8*CLOS_COUNT)  /* u8[CLOS_COUNT]: sizes */
+#define DATA_NF_MODE        112     /* u64: 1 = normalize to full NF before output, 0 = WHNF */
+#define DATA_SPACE0_SIZE    120     /* u64: size of semispace 0 (may differ while growing) */
+#define DATA_SPACE1_SIZE    128     /* u64: size of semispace 1 */
+#define DATA_GC_ROOT_K      136     /* void*: rbx (continuation) saved across a collection */
+#define DATA_GC_ROOT_SELF   144     /* void*: rdi (closure being entered) saved across a collection */
+#define DATA_GC_ROOT_VAL    152     /* void*: r14 (incoming value) saved across a collection */
+#define DATA_FROM_BASE      160     /* void*: fromspace bounds during a collection */
+#define DATA_FROM_END       168
+#define DATA_STATIC_BEGIN   176     /* void*: static closure area (ELF: the embedded term) - scanned as roots */
+#define DATA_STATIC_END     184
+#define DATA_ENTRY_TABLE    192     /* void*[CLOS_COUNT]: entry addresses */
+#define DATA_SIZE_TABLE     (192 + 8*CLOS_COUNT)  /* u8[CLOS_COUNT]: sizes */
 #define DATA_PRIM_S         ((DATA_SIZE_TABLE + CLOS_COUNT + 7) & ~7)
 #define DATA_PRIM_K         (DATA_PRIM_S + 8)
 #define DATA_PRIM_I         (DATA_PRIM_K + 8)
@@ -130,6 +152,12 @@ typedef struct {
     u32 entry_offsets[CLOS_COUNT];
     u32 gc_offset;          /* GC routine */
     u32 gc_copy_offset;     /* copy_closure subroutine */
+    u32 gc_classify_offset; /* classify subroutine (entry ptr -> size/ptr bytes) */
+    u32 gc_scavenge_offset; /* scavenge subroutine (copy the fields of one closure) */
+    u32 gc_call_patch[64];  /* rel32 sites of `call gc` emitted by emit_reserve */
+    int n_gc_call;
+    /* Normalization mode baked into the data section: 1 = NF (default), 0 = WHNF */
+    int nf_mode;
     u32 output_offset;      /* output serialization routine */
     u32 start_offset;       /* program entry point */
     

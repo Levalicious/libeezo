@@ -3,7 +3,9 @@
  *
  * Emits SELF-CONTAINED x86_64 code including:
  * - Combinator entry points (S, K, I, S1, S2, K1)
- * - Continuation types (App, ApplyK1, ApplyK2, Halt)
+ * - Thunks and continuations (App, Ind, ApplyK, UpdK, Norm, Field1, Field2, Halt)
+ *   Evaluation is NORMAL ORDER with sharing (call-by-need): App is a thunk,
+ *   arguments are captured unevaluated, results are written back as Ind.
  * - Cheney copying GC (entirely in assembly)
  * - Syscall wrappers (mmap for heap, write for output, exit)
  *
@@ -21,6 +23,7 @@
 #define SYS_write   1
 #define SYS_mmap    9
 #define SYS_munmap  11
+#define SYS_mremap  25
 #define SYS_exit    60
 
 /* mmap flags */
@@ -45,6 +48,7 @@ void native_emit_init(NativeEmit *e, u8 *code_buf, u32 code_cap, OutputFormat fm
     x86_init(&e->code, code_buf, code_cap);
     e->data_size = DATA_SECTION_SIZE;
     e->output_fmt = fmt;
+    e->nf_mode = 1;
 }
 
 /*
@@ -86,45 +90,69 @@ static void emit_get_singleton(X86Buf *b, X86Reg dst, ClosureType type) {
 }
 
 /*
- * Emit: allocate n words on heap
- * Result (old hp) in RAX. Updates r12.
- * If allocation would overflow, stores request size and jumps to gc_needed label.
- * Caller must patch the gc_needed jump target.
- * Returns offset of the rel32 to patch.
+ * Conditional jump rel32 with a patchable displacement.
+ * Returns the offset of the rel32 (pass to x86_patch_rel32).
  */
-static u32 emit_alloc(X86Buf *b, int words) {
-    int bytes = words * 8;
-    
-    /* rax = r12 (old hp, will be return value) */
+#define CC_B   0x82
+#define CC_AE  0x83
+#define CC_E   0x84
+#define CC_NE  0x85
+#define CC_BE  0x86
+#define CC_A   0x87
+#define CC_GE  0x8D
+static u32 emit_jcc(X86Buf *b, u8 cc) {
+    x86_byte(b, 0x0F); x86_byte(b, cc);
+    u32 p = x86_len(b);
+    x86_dword(b, 0);
+    return p;
+}
+
+/* cmovne dst, src */
+static void emit_cmovne(X86Buf *b, X86Reg dst, X86Reg src) {
+    x86_byte(b, 0x48 | (((dst >> 3) & 1) << 2) | ((src >> 3) & 1));
+    x86_byte(b, 0x0F); x86_byte(b, 0x45);
+    x86_byte(b, 0xC0 | ((dst & 7) << 3) | (src & 7));
+}
+
+/* jmp to an already-emitted offset */
+static void emit_jmp_back(X86Buf *b, u32 target) {
+    x86_jmp_rel(b, (i32)target - (i32)(x86_len(b) + 5));
+}
+
+/*
+ * ALLOCATION PROTOCOL
+ *
+ * Every entry code that allocates begins with emit_reserve(words, retry).
+ * If fewer than `words` words remain, the live state (rbx = continuation,
+ * rdi = self, r14 = incoming value) is saved to the data section, the
+ * collector is CALLed, the three roots are reloaded (they moved), and
+ * control jumps back to `retry` - the entry's first instruction - so the
+ * entry re-executes from scratch against the compacted heap. Entries must
+ * not write to the heap before their reserve. After a successful reserve
+ * the allocations themselves are unchecked bumps (emit_bump).
+ */
+static void emit_reserve(NativeEmit *e, int words, u32 retry) {
+    X86Buf *b = &e->code;
+    x86_lea(b, RAX, R12, words * 8);
+    x86_cmp_rr(b, RAX, R13);
+    u32 ok = emit_jcc(b, CC_BE);
+    x86_mov_mi(b, R15, DATA_ALLOC_REQUEST, words * 8);
+    emit_store_data(b, DATA_GC_ROOT_K, RBX);
+    emit_store_data(b, DATA_GC_ROOT_SELF, RDI);
+    emit_store_data(b, DATA_GC_ROOT_VAL, R14);
+    x86_call_rel(b, 0);
+    e->gc_call_patch[e->n_gc_call++] = x86_len(b) - 4;
+    emit_load_data(b, RBX, DATA_GC_ROOT_K);
+    emit_load_data(b, RDI, DATA_GC_ROOT_SELF);
+    emit_load_data(b, R14, DATA_GC_ROOT_VAL);
+    emit_jmp_back(b, retry);
+    x86_patch_rel32(b, ok, x86_len(b));
+}
+
+/* rax = hp; hp += words (space guaranteed by a preceding reserve) */
+static void emit_bump(X86Buf *b, int words) {
     x86_mov_rr(b, RAX, R12);
-    
-    /* r12 += words * 8 */
-    x86_add_ri(b, R12, bytes);
-    
-    /* if r12 >= r13, need GC */
-    x86_cmp_rr(b, R12, R13);
-    
-    /* jb alloc_ok (skip GC path) */
-    u32 ok_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x82); x86_dword(b, 0);
-    
-    /* GC needed - restore r12 and store allocation request */
-    x86_mov_rr(b, R12, RAX);  /* restore hp */
-    /* Store request size in DATA_ALLOC_REQUEST */
-    x86_push(b, RCX);
-    x86_mov_ri(b, RCX, bytes);
-    emit_store_data(b, DATA_ALLOC_REQUEST, RCX);
-    x86_pop(b, RCX);
-    
-    /* jmp gc_needed (patch later) */
-    u32 patch_offset = x86_len(b) + 1;  /* after opcode byte */
-    x86_jmp_rel(b, 0);  /* placeholder */
-    
-    /* alloc_ok: */
-    u32 ok_target = x86_len(b);
-    x86_patch_rel32(b, ok_patch, ok_target);
-    
-    return patch_offset;
+    x86_add_ri(b, R12, words * 8);
 }
 
 /*
@@ -218,273 +246,249 @@ static void emit_entry_K1(NativeEmit *e) {
 }
 
 /*
- * Entry for App[f, x] - application node (NOT a value)
- * eval(App[f,x], k) = eval(f, ApplyK1[x, k])
+ * Entry for App[f, x] - a THUNK (not a value)
+ *
+ *   eval(App[f,x], k) = eval(f, ApplyK[x, UpdK[self, k]])
+ *
+ * x is passed UNEVALUATED (normal order). When the value of the whole
+ * application comes back through UpdK, self is overwritten with an
+ * indirection to it, so every other reference to this thunk shares the
+ * result (call-by-need).
  */
 static void emit_entry_App(NativeEmit *e) {
     X86Buf *b = &e->code;
-    e->entry_offsets[CLOS_APP] = x86_len(b);
-    
-    /* Load f and x from self */
-    /* rcx = f = [rdi + 8] */
-    x86_mov_rm(b, RCX, RDI, 8);
-    /* rdx = x = [rdi + 16] */
-    x86_mov_rm(b, RDX, RDI, 16);
-    
-    /* Allocate ApplyK1[x, k] - 3 words */
-    u32 gc_patch = emit_alloc(b, 3);
-    
-    /* rax = new closure address */
-    /* [rax] = entry_ApplyK1 */
-    emit_get_entry(b, RSI, CLOS_APPLYK1);
+    u32 top = x86_len(b);
+    e->entry_offsets[CLOS_APP] = top;
+    emit_reserve(e, 6, top);
+    x86_mov_rm(b, RCX, RDI, 8);    /* f */
+    x86_mov_rm(b, RDX, RDI, 16);   /* x */
+    /* UpdK[self, k] */
+    emit_bump(b, 3);
+    emit_get_entry(b, RSI, CLOS_UPDK);
     x86_mov_mr(b, RAX, 0, RSI);
-    /* [rax + 8] = x (rdx) */
-    x86_mov_mr(b, RAX, 8, RDX);
-    /* [rax + 16] = k (rbx) */
+    x86_mov_mr(b, RAX, 8, RDI);
     x86_mov_mr(b, RAX, 16, RBX);
-    
-    /* New continuation is the ApplyK1 */
-    x86_mov_rr(b, RBX, RAX);
-    
-    /* Enter f */
-    x86_mov_rr(b, RDI, RCX);
-    emit_enter(b);
-    
-    /* GC needed path - patch jump */
-    u32 gc_target = x86_len(b);
-    x86_patch_rel32(b, gc_patch, gc_target);
-    
-    /* Save state and call GC */
-    emit_store_data(b, DATA_ROOT, RBX);
-    /* Save rdi (self) and rcx, rdx for retry */
-    x86_push(b, RDI);
-    x86_push(b, RCX);
-    x86_push(b, RDX);
-    
-    /* Jump to GC */
-    x86_jmp_rel(b, 0);  /* Will patch to gc_offset */
-    u32 gc_jmp_patch = x86_len(b) - 4;
-    
-    /* After GC, we need to retry - but this is complex.
-     * For now, let's use a simpler approach: GC is a subroutine
-     * that returns here. We'll emit a proper solution later.
-     */
-    (void)gc_jmp_patch;  /* TODO: proper GC integration */
-}
-
-/*
- * Entry for ApplyK1[x_term, k] - continuation waiting for f_val
- * Receives f_val in r14
- * Then: eval(x_term, ApplyK2[f_val, k])
- */
-static void emit_entry_ApplyK1(NativeEmit *e) {
-    X86Buf *b = &e->code;
-    e->entry_offsets[CLOS_APPLYK1] = x86_len(b);
-    
-    /* f_val in r14 */
-    /* x_term = [rdi + 8] */
-    x86_mov_rm(b, RCX, RDI, 8);
-    /* k = [rdi + 16] */
-    x86_mov_rm(b, RDX, RDI, 16);
-    
-    /* Allocate ApplyK2[f_val, k] - 3 words */
-    u32 gc_patch = emit_alloc(b, 3);
-    
-    /* [rax] = entry_ApplyK2 */
-    emit_get_entry(b, RSI, CLOS_APPLYK2);
+    x86_mov_rr(b, R8, RAX);
+    /* ApplyK[x, updk] */
+    emit_bump(b, 3);
+    emit_get_entry(b, RSI, CLOS_APPLYK);
     x86_mov_mr(b, RAX, 0, RSI);
-    /* [rax + 8] = f_val (r14) */
-    x86_mov_mr(b, RAX, 8, R14);
-    /* [rax + 16] = k (rdx) */
-    x86_mov_mr(b, RAX, 16, RDX);
-    
-    /* New continuation is ApplyK2 */
+    x86_mov_mr(b, RAX, 8, RDX);
+    x86_mov_mr(b, RAX, 16, R8);
     x86_mov_rr(b, RBX, RAX);
-    
-    /* Enter x_term */
+    /* enter f */
     x86_mov_rr(b, RDI, RCX);
     emit_enter(b);
-    
-    /* GC path */
-    u32 gc_target = x86_len(b);
-    x86_patch_rel32(b, gc_patch, gc_target);
-    emit_store_data(b, DATA_ROOT, RBX);
-    /* TODO: proper GC call */
-    x86_int3(b);  /* trap for now */
 }
 
 /*
- * Entry for ApplyK2[f_val, k] - continuation waiting for x_val
- * Receives x_val in r14
- * Then: apply(f_val, x_val, k)
+ * Entry for Ind[v] - an updated thunk: enter its value
  */
-static void emit_entry_ApplyK2(NativeEmit *e) {
+static void emit_entry_Ind(NativeEmit *e) {
     X86Buf *b = &e->code;
-    e->entry_offsets[CLOS_APPLYK2] = x86_len(b);
-    
-    /* x_val in r14 */
-    /* f_val = [rdi + 8] */
-    x86_mov_rm(b, RCX, RDI, 8);
-    /* k = [rdi + 16] */
-    x86_mov_rm(b, RDX, RDI, 16);
-    
-    /* Now dispatch on f_val type to do apply(f_val, x_val, k) */
-    /* f_val entry ptr is [rcx] */
+    e->entry_offsets[CLOS_IND] = x86_len(b);
+    x86_mov_rm(b, RDI, RDI, 8);
+    emit_enter(b);
+}
+
+/*
+ * Entry for UpdK[thunk, k] - receives the thunk's value in r14.
+ * Overwrites the thunk (3 words) with Ind[value] (2 words), passes value to k.
+ */
+static void emit_entry_UpdK(NativeEmit *e) {
+    X86Buf *b = &e->code;
+    e->entry_offsets[CLOS_UPDK] = x86_len(b);
+    x86_mov_rm(b, RCX, RDI, 8);    /* thunk */
+    x86_mov_rm(b, RDX, RDI, 16);   /* k */
+    emit_get_entry(b, RSI, CLOS_IND);
+    x86_mov_mr(b, RCX, 0, RSI);
+    x86_mov_mr(b, RCX, 8, R14);
+    x86_mov_rr(b, RBX, RDX);
+    emit_call_cont(b);
+}
+
+/*
+ * Dispatch on the entry pointer in RSI against a list of closure types.
+ * patch[i] receives the rel32 offset of the je for types[i]. Falls
+ * through when none match. Clobbers R8.
+ */
+static void emit_dispatch(X86Buf *b, const ClosureType *types, int n, u32 *patch) {
+    for (int i = 0; i < n; i++) {
+        emit_get_entry(b, R8, types[i]);
+        x86_cmp_rr(b, RSI, R8);
+        patch[i] = emit_jcc(b, CC_E);
+    }
+}
+
+/*
+ * Entry for ApplyK[x, k] - receives f_val in r14; performs apply(f_val, x, k).
+ * x is an arbitrary closure (usually an unevaluated thunk): it is captured,
+ * never evaluated here, so evaluation stays normal-order.
+ */
+static void emit_entry_ApplyK(NativeEmit *e) {
+    X86Buf *b = &e->code;
+    u32 top = x86_len(b);
+    e->entry_offsets[CLOS_APPLYK] = top;
+    emit_reserve(e, 9, top);                /* worst case: the S2 rule */
+    x86_mov_rm(b, RCX, RDI, 8);             /* x */
+    x86_mov_rm(b, RDX, RDI, 16);            /* k */
+    x86_mov_rm(b, RSI, R14, 0);             /* f_val entry */
+    static const ClosureType cases[] = { CLOS_S, CLOS_K, CLOS_I, CLOS_S1, CLOS_S2, CLOS_K1 };
+    u32 p[6];
+    emit_dispatch(b, cases, 6, p);
+    x86_int3(b);                            /* a non-value reached a continuation */
+    /* S x -> k(S1[x]) */
+    x86_patch_rel32(b, p[0], x86_len(b));
+    emit_bump(b, 2);
+    emit_get_entry(b, RSI, CLOS_S1);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, RCX);
+    x86_mov_rr(b, R14, RAX);
+    x86_mov_rr(b, RBX, RDX);
+    emit_call_cont(b);
+    /* K x -> k(K1[x]) */
+    x86_patch_rel32(b, p[1], x86_len(b));
+    emit_bump(b, 2);
+    emit_get_entry(b, RSI, CLOS_K1);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, RCX);
+    x86_mov_rr(b, R14, RAX);
+    x86_mov_rr(b, RBX, RDX);
+    emit_call_cont(b);
+    /* I x -> eval(x, k) */
+    x86_patch_rel32(b, p[2], x86_len(b));
+    x86_mov_rr(b, RDI, RCX);
+    x86_mov_rr(b, RBX, RDX);
+    emit_enter(b);
+    /* S1[a] x -> k(S2[a, x]) */
+    x86_patch_rel32(b, p[3], x86_len(b));
+    x86_mov_rm(b, R8, R14, 8);
+    emit_bump(b, 3);
+    emit_get_entry(b, RSI, CLOS_S2);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, R8);
+    x86_mov_mr(b, RAX, 16, RCX);
+    x86_mov_rr(b, R14, RAX);
+    x86_mov_rr(b, RBX, RDX);
+    emit_call_cont(b);
+    /* S2[a,b] z -> eval(a, ApplyK[z, ApplyK[App[b,z], k]])   (= a z (b z)) */
+    x86_patch_rel32(b, p[4], x86_len(b));
+    x86_mov_rm(b, R8, R14, 8);              /* a */
+    x86_mov_rm(b, R9, R14, 16);             /* b */
+    emit_bump(b, 3);                        /* App[b, z]: a shared thunk */
+    emit_get_entry(b, RSI, CLOS_APP);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, R9);
+    x86_mov_mr(b, RAX, 16, RCX);
+    x86_mov_rr(b, R10, RAX);
+    emit_bump(b, 3);                        /* ApplyK[bz, k] */
+    emit_get_entry(b, RSI, CLOS_APPLYK);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, R10);
+    x86_mov_mr(b, RAX, 16, RDX);
+    x86_mov_rr(b, R11, RAX);
+    emit_bump(b, 3);                        /* ApplyK[z, that] */
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, RCX);
+    x86_mov_mr(b, RAX, 16, R11);
+    x86_mov_rr(b, RBX, RAX);
+    x86_mov_rr(b, RDI, R8);
+    emit_enter(b);
+    /* K1[a] x -> eval(a, k) */
+    x86_patch_rel32(b, p[5], x86_len(b));
+    x86_mov_rm(b, RDI, R14, 8);
+    x86_mov_rr(b, RBX, RDX);
+    emit_enter(b);
+}
+
+/*
+ * NORMAL-FORM PASS
+ *
+ * Norm[k] receives a value v (weak head normal form). Primitives are
+ * already normal. A partial application S1[x] / K1[x] / S2[x,y] is normal
+ * once its captured arguments are: each is evaluated under a fresh Norm
+ * whose continuation Field1/Field2 stores the normal form back into v in
+ * place (the argument is replaced by an equal term), then k receives v.
+ * The initial continuation is Norm[Halt] in NF mode and Halt in WHNF mode.
+ */
+static void emit_entry_Norm(NativeEmit *e) {
+    X86Buf *b = &e->code;
+    u32 top = x86_len(b);
+    e->entry_offsets[CLOS_NORM] = top;
+    emit_reserve(e, 5, top);
+    x86_mov_rm(b, RDX, RDI, 8);             /* k */
+    x86_mov_rm(b, RSI, R14, 0);             /* v entry */
+    static const ClosureType prims[] = { CLOS_S, CLOS_K, CLOS_I };
+    static const ClosureType paps[]  = { CLOS_S1, CLOS_K1, CLOS_S2 };
+    u32 pp[3], pq[3];
+    emit_dispatch(b, prims, 3, pp);
+    emit_dispatch(b, paps, 3, pq);
+    x86_int3(b);
+    /* primitive: already normal */
+    for (int i = 0; i < 3; i++) x86_patch_rel32(b, pp[i], x86_len(b));
+    x86_mov_rr(b, RBX, RDX);
+    emit_call_cont(b);
+    /* partial application: eval(v.x, Norm[Field1[v, k]]) */
+    for (int i = 0; i < 3; i++) x86_patch_rel32(b, pq[i], x86_len(b));
+    emit_bump(b, 3);
+    emit_get_entry(b, RSI, CLOS_FIELD1);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, R14);
+    x86_mov_mr(b, RAX, 16, RDX);
+    x86_mov_rr(b, R8, RAX);
+    emit_bump(b, 2);
+    emit_get_entry(b, RSI, CLOS_NORM);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, R8);
+    x86_mov_rr(b, RBX, RAX);
+    x86_mov_rm(b, RDI, R14, 8);
+    emit_enter(b);
+}
+
+/* Field1[v, k]: receives nf(v.x); stores it; S2 continues with y, others finish */
+static void emit_entry_Field1(NativeEmit *e) {
+    X86Buf *b = &e->code;
+    u32 top = x86_len(b);
+    e->entry_offsets[CLOS_FIELD1] = top;
+    emit_reserve(e, 5, top);
+    x86_mov_rm(b, RCX, RDI, 8);             /* v */
+    x86_mov_rm(b, RDX, RDI, 16);            /* k */
+    x86_mov_mr(b, RCX, 8, R14);             /* v.x := nf(v.x) */
     x86_mov_rm(b, RSI, RCX, 0);
-    
-    /* Compare against each entry type */
-    /* if f_val.entry == entry_S: apply_S */
-    emit_get_entry(b, R8, CLOS_S);
-    x86_cmp_rr(b, RSI, R8);
-    u32 apply_s_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);  /* je apply_S */
-    
-    /* if f_val.entry == entry_K: apply_K */
-    emit_get_entry(b, R8, CLOS_K);
-    x86_cmp_rr(b, RSI, R8);
-    u32 apply_k_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);  /* je apply_K */
-    
-    /* if f_val.entry == entry_I: apply_I */
-    emit_get_entry(b, R8, CLOS_I);
-    x86_cmp_rr(b, RSI, R8);
-    u32 apply_i_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);  /* je apply_I */
-    
-    /* if f_val.entry == entry_S1: apply_S1 */
-    emit_get_entry(b, R8, CLOS_S1);
-    x86_cmp_rr(b, RSI, R8);
-    u32 apply_s1_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);  /* je apply_S1 */
-    
-    /* if f_val.entry == entry_S2: apply_S2 */
     emit_get_entry(b, R8, CLOS_S2);
     x86_cmp_rr(b, RSI, R8);
-    u32 apply_s2_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);  /* je apply_S2 */
-    
-    /* if f_val.entry == entry_K1: apply_K1 */
-    emit_get_entry(b, R8, CLOS_K1);
-    x86_cmp_rr(b, RSI, R8);
-    u32 apply_k1_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);  /* je apply_K1 */
-    
-    /* Unknown - shouldn't happen, trap */
-    x86_int3(b);
-    
-    /* apply_S: S x_val k -> k(S1[x_val]) */
-    u32 apply_s_target = x86_len(b);
-    x86_patch_rel32(b, apply_s_patch, apply_s_target);
-    {
-        /* Allocate S1[x_val] - 2 words */
-        u32 gc_patch = emit_alloc(b, 2);
-        emit_get_entry(b, RSI, CLOS_S1);
-        x86_mov_mr(b, RAX, 0, RSI);
-        x86_mov_mr(b, RAX, 8, R14);  /* x_val */
-        /* k(S1) */
-        x86_mov_rr(b, R14, RAX);
-        x86_mov_rr(b, RBX, RDX);  /* k */
-        emit_call_cont(b);
-        /* GC path */
-        x86_patch_rel32(b, gc_patch, x86_len(b));
-        x86_int3(b);
-    }
-    
-    /* apply_K: K x_val k -> k(K1[x_val]) */
-    u32 apply_k_target = x86_len(b);
-    x86_patch_rel32(b, apply_k_patch, apply_k_target);
-    {
-        u32 gc_patch = emit_alloc(b, 2);
-        emit_get_entry(b, RSI, CLOS_K1);
-        x86_mov_mr(b, RAX, 0, RSI);
-        x86_mov_mr(b, RAX, 8, R14);
-        x86_mov_rr(b, R14, RAX);
-        x86_mov_rr(b, RBX, RDX);
-        emit_call_cont(b);
-        x86_patch_rel32(b, gc_patch, x86_len(b));
-        x86_int3(b);
-    }
-    
-    /* apply_I: I x_val k -> k(x_val) */
-    u32 apply_i_target = x86_len(b);
-    x86_patch_rel32(b, apply_i_patch, apply_i_target);
-    {
-        /* r14 already has x_val */
-        x86_mov_rr(b, RBX, RDX);  /* k */
-        emit_call_cont(b);
-    }
-    
-    /* apply_S1: S1[a] x_val k -> k(S2[a, x_val]) */
-    u32 apply_s1_target = x86_len(b);
-    x86_patch_rel32(b, apply_s1_patch, apply_s1_target);
-    {
-        /* a = [rcx + 8] */
-        x86_mov_rm(b, R8, RCX, 8);
-        u32 gc_patch = emit_alloc(b, 3);
-        emit_get_entry(b, RSI, CLOS_S2);
-        x86_mov_mr(b, RAX, 0, RSI);
-        x86_mov_mr(b, RAX, 8, R8);   /* a */
-        x86_mov_mr(b, RAX, 16, R14); /* x_val */
-        x86_mov_rr(b, R14, RAX);
-        x86_mov_rr(b, RBX, RDX);
-        emit_call_cont(b);
-        x86_patch_rel32(b, gc_patch, x86_len(b));
-        x86_int3(b);
-    }
-    
-    /* apply_S2: S2[a,b] z k -> eval(App(App(a,z), App(b,z)), k) */
-    u32 apply_s2_target = x86_len(b);
-    x86_patch_rel32(b, apply_s2_patch, apply_s2_target);
-    {
-        /* a = [rcx + 8], b = [rcx + 16], z = r14 */
-        x86_mov_rm(b, R8, RCX, 8);   /* a */
-        x86_mov_rm(b, R9, RCX, 16);  /* b */
-        /* z is in r14 */
-        
-        /* Need to build: App(App(a,z), App(b,z)) */
-        /* That's 3 App nodes: App(a,z), App(b,z), App(first, second) */
-        
-        /* Allocate 3 * 3 = 9 words */
-        u32 gc_patch = emit_alloc(b, 9);
-        
-        /* rax points to first of 3 consecutive App closures */
-        /* App(a,z) at rax */
-        emit_get_entry(b, RSI, CLOS_APP);
-        x86_mov_mr(b, RAX, 0, RSI);
-        x86_mov_mr(b, RAX, 8, R8);   /* a */
-        x86_mov_mr(b, RAX, 16, R14); /* z */
-        
-        /* App(b,z) at rax+24 */
-        x86_mov_mr(b, RAX, 24, RSI);
-        x86_mov_mr(b, RAX, 32, R9);  /* b */
-        x86_mov_mr(b, RAX, 40, R14); /* z */
-        
-        /* App(App(a,z), App(b,z)) at rax+48 */
-        x86_mov_mr(b, RAX, 48, RSI);
-        /* [rax+56] = rax (App(a,z)) */
-        x86_mov_mr(b, RAX, 56, RAX);
-        /* [rax+64] = rax+24 (App(b,z)) */
-        x86_lea(b, R10, RAX, 24);
-        x86_mov_mr(b, RAX, 64, R10);
-        
-        /* Enter the outer App with continuation k */
-        x86_mov_rr(b, RBX, RDX);  /* k */
-        x86_lea(b, RDI, RAX, 48);
-        emit_enter(b);
-        
-        x86_patch_rel32(b, gc_patch, x86_len(b));
-        x86_int3(b);
-    }
-    
-    /* apply_K1: K1[a] x_val k -> k(a) */
-    u32 apply_k1_target = x86_len(b);
-    x86_patch_rel32(b, apply_k1_patch, apply_k1_target);
-    {
-        /* a = [rcx + 8] */
-        x86_mov_rm(b, R14, RCX, 8);
-        x86_mov_rr(b, RBX, RDX);
-        emit_call_cont(b);
-    }
+    u32 is_s2 = emit_jcc(b, CC_E);
+    /* S1 / K1: done -> k(v) */
+    x86_mov_rr(b, R14, RCX);
+    x86_mov_rr(b, RBX, RDX);
+    emit_call_cont(b);
+    /* S2: eval(v.y, Norm[Field2[v, k]]) */
+    x86_patch_rel32(b, is_s2, x86_len(b));
+    emit_bump(b, 3);
+    emit_get_entry(b, RSI, CLOS_FIELD2);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, RCX);
+    x86_mov_mr(b, RAX, 16, RDX);
+    x86_mov_rr(b, R8, RAX);
+    emit_bump(b, 2);
+    emit_get_entry(b, RSI, CLOS_NORM);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, R8);
+    x86_mov_rr(b, RBX, RAX);
+    x86_mov_rm(b, RDI, RCX, 16);
+    emit_enter(b);
+}
+
+/* Field2[v, k]: receives nf(v.y); stores it; k(v) */
+static void emit_entry_Field2(NativeEmit *e) {
+    X86Buf *b = &e->code;
+    e->entry_offsets[CLOS_FIELD2] = x86_len(b);
+    x86_mov_rm(b, RCX, RDI, 8);
+    x86_mov_rm(b, RDX, RDI, 16);
+    x86_mov_mr(b, RCX, 16, R14);
+    x86_mov_rr(b, R14, RCX);
+    x86_mov_rr(b, RBX, RDX);
+    emit_call_cont(b);
 }
 
 /*
@@ -515,477 +519,261 @@ static void emit_entry_Fwd(NativeEmit *e) {
  * GARBAGE COLLECTOR (in assembly)
  * ======================================================================== */
 
-static void emit_gc(NativeEmit *e) {
+/*
+ * classify: RSI = entry pointer -> RCX = pointer-field bytes, RDX = closure bytes.
+ * Generated from CLOS_PTRS / CLOS_SIZES. Clobbers R8. Traps on an unknown entry.
+ */
+static void emit_classify(NativeEmit *e) {
     X86Buf *b = &e->code;
-    e->gc_offset = x86_len(b);
-    
-    /*
-     * Cheney copying GC
-     *
-     * On entry: root saved in DATA_ROOT
-     * 
-     * Algorithm:
-     *   1. Swap spaces
-     *   2. Set hp = scan = tospace base
-     *   3. Copy root
-     *   4. While scan < hp: scavenge closure at scan, advance scan
-     *   5. Update DATA_ROOT with new root location
-     *   6. Return (caller retries allocation)
-     */
-    
-    /* Save callee-saved registers we'll use */
-    x86_push(b, RBX);
-    x86_push(b, R12);
-    x86_push(b, R13);
-    x86_push(b, R14);
-    x86_push(b, R15);
-    
-    /* r15 = data base (already set, but reload to be safe) */
-    /* TODO: need to establish r15 if not already set */
-    
-    /* Swap active space: active = 1 - active */
-    emit_load_data(b, RAX, DATA_ACTIVE);
-    x86_mov_ri(b, RCX, 1);
-    x86_sub_ri(b, RCX, 0);  /* This doesn't work - need xor */
-    /* Actually: new_active = 1 ^ old_active */
-    x86_byte(b, 0x48); x86_byte(b, 0x31); x86_byte(b, 0xC1);  /* xor rcx, rax (but we want 1 xor rax) */
-    /* Let me redo this properly */
-    
-    /* rcx = 1 */
-    x86_mov_ri(b, RCX, 1);
-    /* rcx ^= rax (old active) */
-    x86_byte(b, 0x48); x86_byte(b, 0x31); x86_byte(b, 0xC1);  /* xor rcx, rax */
-    /* Now rcx = new active */
-    emit_store_data(b, DATA_ACTIVE, RCX);
-    
-    /* Get tospace base: if new_active==0, tospace=space0, else space1 */
-    /* r8 = space0, r9 = space1 */
-    emit_load_data(b, R8, DATA_SPACE0);
-    emit_load_data(b, R9, DATA_SPACE1);
-    
-    /* tospace = (new_active == 0) ? space0 : space1 */
-    /* Use cmov: r10 = space0, then if rcx!=0, r10 = space1 */
-    x86_mov_rr(b, R10, R8);
-    x86_cmp_ri(b, RCX, 0);
-    /* cmovne r10, r9 */
-    x86_byte(b, 0x4D); x86_byte(b, 0x0F); x86_byte(b, 0x45); x86_byte(b, 0xD1);
-    
-    /* r10 = tospace base */
-    /* Set hp = scan = tospace */
-    x86_mov_rr(b, R12, R10);  /* hp */
-    emit_store_data(b, DATA_HP, R12);
-    emit_store_data(b, DATA_SCAN, R10);
-    
-    /* Set limit = tospace + space_size */
-    emit_load_data(b, R13, DATA_SPACE_SIZE);
-    x86_add_rr(b, R13, R10);
-    emit_store_data(b, DATA_LIMIT, R13);
-    
-    /* Copy root */
-    emit_load_data(b, RDI, DATA_ROOT);  /* rdi = root to copy */
-    /* Call copy_closure subroutine */
-    x86_call_rel(b, 0);  /* Will patch */
-    u32 copy_root_patch = x86_len(b) - 4;
-    /* rax = new root location */
-    emit_store_data(b, DATA_ROOT, RAX);
-    
-    /* Cheney loop: while scan < hp */
-    u32 loop_start = x86_len(b);
-    emit_load_data(b, RCX, DATA_SCAN);
-    x86_cmp_rr(b, RCX, R12);  /* scan vs hp */
-    /* jae loop_done */
-    u32 loop_done_patch = x86_len(b) + 2;
-    x86_jae_rel(b, 0);
-    
-    /* Scavenge closure at scan */
-    /* Get closure type from entry ptr */
-    x86_mov_rm(b, RSI, RCX, 0);  /* entry ptr */
-    
-    /* For each pointer field, copy it */
-    /* This is type-dependent. We need to check entry against each type. */
-    /* For simplicity, let's handle the common cases inline */
-    
-    /* Check if it's S, K, I, or Halt (0 pointers) */
-    emit_get_entry(b, R8, CLOS_S);
-    x86_cmp_rr(b, RSI, R8);
-    u32 skip_s = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);  /* je no_ptrs */
-    
-    emit_get_entry(b, R8, CLOS_K);
-    x86_cmp_rr(b, RSI, R8);
-    u32 skip_k = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    emit_get_entry(b, R8, CLOS_I);
-    x86_cmp_rr(b, RSI, R8);
-    u32 skip_i = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    emit_get_entry(b, R8, CLOS_HALT);
-    x86_cmp_rr(b, RSI, R8);
-    u32 skip_halt = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    /* Check for 1-pointer types: S1, K1, FWD */
-    emit_get_entry(b, R8, CLOS_S1);
-    x86_cmp_rr(b, RSI, R8);
-    u32 one_ptr_s1 = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    emit_get_entry(b, R8, CLOS_K1);
-    x86_cmp_rr(b, RSI, R8);
-    u32 one_ptr_k1 = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    /* Everything else has 2 pointers */
-    /* Copy [rcx+8] */
-    x86_push(b, RCX);
-    x86_mov_rm(b, RDI, RCX, 8);
-    x86_call_rel(b, 0);
-    u32 copy1_patch = x86_len(b) - 4;
-    x86_pop(b, RCX);
-    x86_mov_mr(b, RCX, 8, RAX);
-    
-    /* Copy [rcx+16] */
-    x86_push(b, RCX);
-    x86_mov_rm(b, RDI, RCX, 16);
-    x86_call_rel(b, 0);
-    u32 copy2_patch = x86_len(b) - 4;
-    x86_pop(b, RCX);
-    x86_mov_mr(b, RCX, 16, RAX);
-    
-    /* Advance scan by 3 words */
-    x86_add_ri(b, RCX, 24);
-    emit_store_data(b, DATA_SCAN, RCX);
-    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
-    
-    /* 1-pointer path */
-    u32 one_ptr_target = x86_len(b);
-    x86_patch_rel32(b, one_ptr_s1, one_ptr_target);
-    x86_patch_rel32(b, one_ptr_k1, one_ptr_target);
-    
-    x86_push(b, RCX);
-    x86_mov_rm(b, RDI, RCX, 8);
-    x86_call_rel(b, 0);
-    u32 copy_one_patch = x86_len(b) - 4;
-    x86_pop(b, RCX);
-    x86_mov_mr(b, RCX, 8, RAX);
-    
-    x86_add_ri(b, RCX, 16);
-    emit_store_data(b, DATA_SCAN, RCX);
-    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
-    
-    /* No pointers path */
-    u32 no_ptrs_target = x86_len(b);
-    x86_patch_rel32(b, skip_s, no_ptrs_target);
-    x86_patch_rel32(b, skip_k, no_ptrs_target);
-    x86_patch_rel32(b, skip_i, no_ptrs_target);
-    x86_patch_rel32(b, skip_halt, no_ptrs_target);
-    
-    x86_add_ri(b, RCX, 8);
-    emit_store_data(b, DATA_SCAN, RCX);
-    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
-    
-    /* Loop done */
-    u32 loop_done_target = x86_len(b);
-    x86_patch_rel32(b, loop_done_patch, loop_done_target);
-    
-    /*
-     * GC complete. Check if we have enough space for pending allocation.
-     * DATA_ALLOC_REQUEST holds the bytes requested when GC was triggered.
-     * If hp + request > limit, need to grow heap.
-     */
-    emit_load_data(b, RAX, DATA_ALLOC_REQUEST);
-    x86_add_rr(b, RAX, R12);  /* rax = hp + request */
-    x86_cmp_rr(b, RAX, R13);  /* compare with limit */
-    u32 space_ok_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x86); x86_dword(b, 0);  /* jbe space_ok */
-    
-    /*
-     * Not enough space after GC - try to grow heap.
-     * New size = current_size * 2 (double it)
-     * Check against max_space_size
-     */
-    emit_load_data(b, RAX, DATA_SPACE_SIZE);
-    x86_byte(b, 0x48); x86_byte(b, 0xD1); x86_byte(b, 0xE0);  /* shl rax, 1 (double) */
-    
-    emit_load_data(b, RCX, DATA_MAX_SPACE_SIZE);
-    x86_cmp_rr(b, RAX, RCX);
-    u32 can_grow_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x86); x86_dword(b, 0);  /* jbe can_grow */
-    
-    /* Can't grow - OOM. Exit with code 137 (128 + SIGKILL-ish) */
-    x86_mov_ri(b, RAX, SYS_write);
-    x86_mov_ri(b, RDI, 2);  /* stderr */
-    /* We need an error message - use immediate bytes on stack */
-    /* Push "OOM\n" backwards */
-    x86_push(b, RAX);  /* make space */
-    x86_mov_ri(b, RAX, 0x0A4D4F4F);  /* "OOM\n" little-endian */
-    x86_mov_mr(b, RSP, 0, RAX);
-    x86_mov_rr(b, RSI, RSP);
-    x86_mov_ri(b, RDX, 4);
-    x86_mov_ri(b, RAX, SYS_write);
-    emit_syscall(b);
-    x86_mov_ri(b, RAX, SYS_exit);
-    x86_mov_ri(b, RDI, 137);
-    emit_syscall(b);
-    
-    /* can_grow: rax = new_size, allocate new spaces via mremap */
-    u32 can_grow_target = x86_len(b);
-    x86_patch_rel32(b, can_grow_patch, can_grow_target);
-    
-    /* Save new size in r8 */
-    x86_mov_rr(b, R8, RAX);
-    
-    /* mremap space0: mremap(old_addr, old_size, new_size, MREMAP_MAYMOVE) */
-    emit_load_data(b, RDI, DATA_SPACE0);
-    emit_load_data(b, RSI, DATA_SPACE_SIZE);
-    x86_mov_rr(b, RDX, R8);  /* new size */
-    x86_mov_ri(b, R10, 1);   /* MREMAP_MAYMOVE */
-    x86_mov_ri(b, RAX, 25);  /* SYS_mremap */
-    emit_syscall(b);
-    
-    /* Check for error (rax < 0 or MAP_FAILED) */
-    x86_cmp_ri(b, RAX, 0);
-    u32 mremap0_ok_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x8D); x86_dword(b, 0);  /* jge ok */
-    /* mremap failed - treat as OOM */
-    x86_mov_ri(b, RAX, SYS_exit);
-    x86_mov_ri(b, RDI, 137);
-    emit_syscall(b);
-    
-    u32 mremap0_ok_target = x86_len(b);
-    x86_patch_rel32(b, mremap0_ok_patch, mremap0_ok_target);
-    emit_store_data(b, DATA_SPACE0, RAX);
-    
-    /* mremap space1 */
-    emit_load_data(b, RDI, DATA_SPACE1);
-    emit_load_data(b, RSI, DATA_SPACE_SIZE);
-    x86_mov_rr(b, RDX, R8);
-    x86_mov_ri(b, R10, 1);
-    x86_mov_ri(b, RAX, 25);
-    emit_syscall(b);
-    
-    x86_cmp_ri(b, RAX, 0);
-    u32 mremap1_ok_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x8D); x86_dword(b, 0);
-    x86_mov_ri(b, RAX, SYS_exit);
-    x86_mov_ri(b, RDI, 137);
-    emit_syscall(b);
-    
-    u32 mremap1_ok_target = x86_len(b);
-    x86_patch_rel32(b, mremap1_ok_patch, mremap1_ok_target);
-    emit_store_data(b, DATA_SPACE1, RAX);
-    
-    /* Update space_size */
-    emit_store_data(b, DATA_SPACE_SIZE, R8);
-    
-    /* Update limit based on new active space */
-    emit_load_data(b, RAX, DATA_ACTIVE);
-    emit_load_data(b, RCX, DATA_SPACE0);
-    emit_load_data(b, RDX, DATA_SPACE1);
-    x86_cmp_ri(b, RAX, 0);
-    x86_mov_rr(b, R13, RCX);  /* assume active=0, use space0 */
-    /* cmovne r13, rdx */
-    x86_byte(b, 0x4C); x86_byte(b, 0x0F); x86_byte(b, 0x45); x86_byte(b, 0xEA);
-    x86_add_rr(b, R13, R8);  /* limit = base + new_size */
-    emit_store_data(b, DATA_LIMIT, R13);
-    
-    /* space_ok: */
-    u32 space_ok_target = x86_len(b);
-    x86_patch_rel32(b, space_ok_patch, space_ok_target);
-    
-    /* Restore registers */
-    x86_pop(b, R15);
-    x86_pop(b, R14);
-    x86_pop(b, R13);
-    x86_pop(b, R12);
-    x86_pop(b, RBX);
-    
-    /* Reload r12, r13 from data section */
-    emit_load_data(b, R12, DATA_HP);
-    emit_load_data(b, R13, DATA_LIMIT);
-    
-    x86_ret(b);
-    
-    /* Now emit copy_closure subroutine */
+    e->gc_classify_offset = x86_len(b);
+    u32 p[CLOS_COUNT];
+    for (int t = 0; t < CLOS_COUNT; t++) {
+        emit_get_entry(b, R8, (ClosureType)t);
+        x86_cmp_rr(b, RSI, R8);
+        p[t] = emit_jcc(b, CC_E);
+    }
+    x86_int3(b);
+    for (int t = 0; t < CLOS_COUNT; t++) {
+        x86_patch_rel32(b, p[t], x86_len(b));
+        x86_mov_ri(b, RCX, CLOS_PTRS[t] * 8);
+        x86_mov_ri(b, RDX, CLOS_SIZES[t] * 8);
+        x86_ret(b);
+    }
+}
+
+/*
+ * copy_closure: RDI = closure -> RAX = its tospace address.
+ * Outside the fromspace (NULL, data-section singletons): returned unchanged.
+ * Forwarded: the forwarding target. Otherwise copied, forwarded, returned.
+ * Clobbers RCX, RDX, RSI, R8-R11. Bumps R12 (hp).
+ */
+static void emit_copy_closure(NativeEmit *e) {
+    X86Buf *b = &e->code;
     e->gc_copy_offset = x86_len(b);
-    
-    /* Patch the calls to copy_closure */
-    x86_patch_rel32(b, copy_root_patch, e->gc_copy_offset);
-    x86_patch_rel32(b, copy1_patch, e->gc_copy_offset);
-    x86_patch_rel32(b, copy2_patch, e->gc_copy_offset);
-    x86_patch_rel32(b, copy_one_patch, e->gc_copy_offset);
-    
-    /*
-     * copy_closure(rdi = from) -> rax = to
-     * If from is NULL or not in fromspace, return from unchanged.
-     * If from is forwarding ptr, return target.
-     * Otherwise, copy to tospace, install forwarding ptr, return new addr.
-     */
-    
-    /* Check NULL */
     x86_mov_rr(b, RAX, RDI);
-    x86_cmp_ri(b, RDI, 0);
-    u32 null_ret = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);  /* je return */
-    
-    /* Check if in fromspace */
-    /* fromspace = (active==0) ? space1 : space0 (opposite of tospace) */
-    emit_load_data(b, RAX, DATA_ACTIVE);
-    emit_load_data(b, R8, DATA_SPACE0);
-    emit_load_data(b, R9, DATA_SPACE1);
-    /* fromspace = (active==0) ? space1 : space0 */
-    x86_cmp_ri(b, RAX, 0);
-    x86_mov_rr(b, R10, R9);  /* assume active==0, so from=space1 */
-    /* cmovne r10, r8 */
-    x86_byte(b, 0x4D); x86_byte(b, 0x0F); x86_byte(b, 0x45); x86_byte(b, 0xD0);
-    
-    /* Check: from_base <= rdi < from_base + space_size */
-    x86_cmp_rr(b, RDI, R10);
-    u32 not_in_from1 = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x82); x86_dword(b, 0);  /* jb return (below fromspace) */
-    
-    emit_load_data(b, R11, DATA_SPACE_SIZE);
-    x86_add_rr(b, R11, R10);  /* r11 = from_end */
-    x86_cmp_rr(b, RDI, R11);
-    u32 not_in_from2 = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x83); x86_dword(b, 0);  /* jae return (above fromspace) */
-    
-    /* Check for forwarding pointer */
-    x86_mov_rm(b, RSI, RDI, 0);  /* entry ptr */
+    x86_cmp_rm(b, RDI, R15, DATA_FROM_BASE);
+    u32 out1 = emit_jcc(b, CC_B);
+    x86_cmp_rm(b, RDI, R15, DATA_FROM_END);
+    u32 out2 = emit_jcc(b, CC_AE);
+    x86_mov_rm(b, RSI, RDI, 0);
     emit_get_entry(b, R8, CLOS_FWD);
     x86_cmp_rr(b, RSI, R8);
-    u32 is_fwd = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);  /* je is_fwd */
-    
-    /* Not forwarded - need to copy */
-    /* Determine size based on entry type */
-    /* For now, use a simple approach: lookup in size table */
-    /* size_table is at DATA_SIZE_TABLE, indexed by type */
-    /* But we have entry ptr, not type. Need entry->type mapping. */
-    /* Simpler: just check each entry and hardcode size */
-    
-    /* This is getting complex. Let's use a size lookup table. */
-    /* Actually, let's just hardcode the checks */
-    
-    x86_mov_ri(b, RCX, 8);  /* default size = 1 word */
-    
-    emit_get_entry(b, R8, CLOS_S1);
-    x86_cmp_rr(b, RSI, R8);
-    u32 size_s1 = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    emit_get_entry(b, R8, CLOS_K1);
-    x86_cmp_rr(b, RSI, R8);
-    u32 size_k1 = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    emit_get_entry(b, R8, CLOS_S2);
-    x86_cmp_rr(b, RSI, R8);
-    u32 size_s2 = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    emit_get_entry(b, R8, CLOS_APP);
-    x86_cmp_rr(b, RSI, R8);
-    u32 size_app = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    emit_get_entry(b, R8, CLOS_APPLYK1);
-    x86_cmp_rr(b, RSI, R8);
-    u32 size_ak1 = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    emit_get_entry(b, R8, CLOS_APPLYK2);
-    x86_cmp_rr(b, RSI, R8);
-    u32 size_ak2 = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    emit_get_entry(b, R8, CLOS_FWD);
-    x86_cmp_rr(b, RSI, R8);
-    u32 size_fwd = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    /* Default: 1 word (S, K, I, Halt) */
-    x86_mov_ri(b, RCX, 8);
-    x86_jmp_rel(b, 0);
-    u32 do_copy_jmp = x86_len(b) - 4;
-    
-    /* Size = 2 words */
-    u32 size_2_target = x86_len(b);
-    x86_patch_rel32(b, size_s1, size_2_target);
-    x86_patch_rel32(b, size_k1, size_2_target);
-    x86_patch_rel32(b, size_fwd, size_2_target);
-    x86_mov_ri(b, RCX, 16);
-    x86_jmp_rel(b, 0);
-    u32 size_2_jmp = x86_len(b) - 4;
-    
-    /* Size = 3 words */
-    u32 size_3_target = x86_len(b);
-    x86_patch_rel32(b, size_s2, size_3_target);
-    x86_patch_rel32(b, size_app, size_3_target);
-    x86_patch_rel32(b, size_ak1, size_3_target);
-    x86_patch_rel32(b, size_ak2, size_3_target);
-    x86_mov_ri(b, RCX, 24);
-    
-    /* Do the copy - rcx = size in bytes, rdi = source */
-    u32 do_copy_target = x86_len(b);
-    x86_patch_rel32(b, do_copy_jmp, do_copy_target);
-    x86_patch_rel32(b, size_2_jmp, do_copy_target);
-    
-    /* Save size in r11 (caller-saved, safe to use here) */
-    x86_mov_rr(b, R11, RCX);
-    
-    /* rax = hp (destination, also return value) */
+    u32 fwd = emit_jcc(b, CC_E);
+    x86_call_rel(b, 0);
+    u32 cls = x86_len(b) - 4;
+    /* copy RDX bytes from RDI to hp */
     x86_mov_rr(b, RAX, R12);
-    
-    /* Copy based on size: always copy word 0 */
-    x86_mov_rm(b, RCX, RDI, 0);
-    x86_mov_mr(b, RAX, 0, RCX);
-    
-    /* If size >= 16, copy word 1 */
-    x86_cmp_ri(b, R11, 16);
-    u32 skip_word1 = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x82); x86_dword(b, 0);  /* jb skip */
-    x86_mov_rm(b, RCX, RDI, 8);
-    x86_mov_mr(b, RAX, 8, RCX);
-    u32 skip_word1_target = x86_len(b);
-    x86_patch_rel32(b, skip_word1, skip_word1_target);
-    
-    /* If size >= 24, copy word 2 */
-    x86_cmp_ri(b, R11, 24);
-    u32 skip_word2 = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x82); x86_dword(b, 0);  /* jb skip */
-    x86_mov_rm(b, RCX, RDI, 16);
-    x86_mov_mr(b, RAX, 16, RCX);
-    u32 skip_word2_target = x86_len(b);
-    x86_patch_rel32(b, skip_word2, skip_word2_target);
-    
-    /* Bump hp by actual size (r11) */
-    x86_add_rr(b, R12, R11);
-    emit_store_data(b, DATA_HP, R12);
-    
-    /* Install forwarding pointer in old location */
+    x86_mov_ri(b, R8, 0);
+    u32 loop = x86_len(b);
+    x86_cmp_rr(b, R8, RDX);
+    u32 done = emit_jcc(b, CC_AE);
+    x86_mov_rr(b, R9, RDI); x86_add_rr(b, R9, R8); x86_mov_rm(b, R9, R9, 0);
+    x86_mov_rr(b, R10, RAX); x86_add_rr(b, R10, R8); x86_mov_mr(b, R10, 0, R9);
+    x86_add_ri(b, R8, 8);
+    emit_jmp_back(b, loop);
+    x86_patch_rel32(b, done, x86_len(b));
+    x86_add_rr(b, R12, RDX);
+    /* forward the old copy */
     emit_get_entry(b, RCX, CLOS_FWD);
     x86_mov_mr(b, RDI, 0, RCX);
     x86_mov_mr(b, RDI, 8, RAX);
-    
-    /* Return new address in rax */
     x86_ret(b);
-    
-    /* Is forwarding pointer - return target */
-    u32 is_fwd_target = x86_len(b);
-    x86_patch_rel32(b, is_fwd, is_fwd_target);
+    x86_patch_rel32(b, fwd, x86_len(b));
     x86_mov_rm(b, RAX, RDI, 8);
     x86_ret(b);
-    
-    /* Return unchanged (null or not in fromspace) */
-    u32 return_target = x86_len(b);
-    x86_patch_rel32(b, null_ret, return_target);
-    x86_patch_rel32(b, not_in_from1, return_target);
-    x86_patch_rel32(b, not_in_from2, return_target);
-    x86_mov_rr(b, RAX, RDI);
+    x86_patch_rel32(b, out1, x86_len(b));
+    x86_patch_rel32(b, out2, x86_len(b));
     x86_ret(b);
+    x86_patch_rel32(b, cls, e->gc_classify_offset);
+}
+
+/*
+ * scavenge: RBX = closure -> copies each pointer field, RBX = next closure.
+ * Uses RBP / R14 as loop state (the caller saves them). Clobbers the rest.
+ */
+static void emit_scavenge(NativeEmit *e) {
+    X86Buf *b = &e->code;
+    e->gc_scavenge_offset = x86_len(b);
+    x86_mov_rm(b, RSI, RBX, 0);
+    x86_call_rel(b, 0); u32 cl = x86_len(b) - 4;         /* rcx = ptr bytes, rdx = size bytes */
+    x86_push(b, RDX);
+    x86_mov_rr(b, R14, RCX); x86_add_ri(b, R14, 8);      /* end offset of pointer fields */
+    x86_mov_ri(b, RBP, 8);                                /* first field */
+    u32 fld = x86_len(b);
+    x86_cmp_rr(b, RBP, R14);
+    u32 fld_done = emit_jcc(b, CC_AE);
+    x86_mov_rr(b, RDI, RBX); x86_add_rr(b, RDI, RBP); x86_mov_rm(b, RDI, RDI, 0);
+    x86_call_rel(b, 0); u32 cp = x86_len(b) - 4;
+    x86_mov_rr(b, R8, RBX); x86_add_rr(b, R8, RBP); x86_mov_mr(b, R8, 0, RAX);
+    x86_add_ri(b, RBP, 8);
+    emit_jmp_back(b, fld);
+    x86_patch_rel32(b, fld_done, x86_len(b));
+    x86_pop(b, RDX);
+    x86_add_rr(b, RBX, RDX);
+    x86_ret(b);
+    x86_patch_rel32(b, cl, e->gc_classify_offset);
+    x86_patch_rel32(b, cp, e->gc_copy_offset);
+}
+
+/* Store RAX (base) / R8 (size) into the slots of the FROM space (1 - active) */
+static void emit_store_from_space(X86Buf *b) {
+    emit_load_data(b, RCX, DATA_ACTIVE);
+    x86_cmp_ri(b, RCX, 0);
+    u32 act1 = emit_jcc(b, CC_NE);
+    emit_store_data(b, DATA_SPACE1, RAX);
+    emit_store_data(b, DATA_SPACE1_SIZE, R8);
+    x86_jmp_rel(b, 0);
+    u32 join = x86_len(b) - 4;
+    x86_patch_rel32(b, act1, x86_len(b));
+    emit_store_data(b, DATA_SPACE0, RAX);
+    emit_store_data(b, DATA_SPACE0_SIZE, R8);
+    x86_patch_rel32(b, join, x86_len(b));
+}
+
+/* RCX = size of the TO (active) space, RDX = size of the FROM space */
+static void emit_load_space_sizes(X86Buf *b) {
+    emit_load_data(b, RAX, DATA_ACTIVE);
+    emit_load_data(b, R10, DATA_SPACE0_SIZE);
+    emit_load_data(b, R11, DATA_SPACE1_SIZE);
+    x86_cmp_ri(b, RAX, 0);
+    x86_mov_rr(b, RCX, R10); emit_cmovne(b, RCX, R11);
+    x86_mov_rr(b, RDX, R11); emit_cmovne(b, RDX, R10);
+}
+
+/*
+ * gc: CALLed from emit_reserve with the roots in DATA_GC_ROOT_{K,SELF,VAL}
+ * and the request in DATA_ALLOC_REQUEST. Flips semispaces, copies the
+ * roots, Cheney-scans, then guarantees hp + request <= limit - growing the
+ * heap if necessary - before returning with R12/R13 = new hp/limit and
+ * the root slots updated.
+ *
+ * Growing: only an EMPTY space is ever remapped (MREMAP_MAYMOVE may move
+ * it, which is harmless when nothing points into it). If the live data
+ * plus the request does not fit after a collection, the just-evacuated
+ * fromspace is doubled and the collection is repeated into it; after a
+ * successful collection the (empty) fromspace is brought up to the same
+ * size, so both spaces are equal again on return.
+ */
+static void emit_gc(NativeEmit *e) {
+    X86Buf *b = &e->code;
+    emit_classify(e);
+    emit_copy_closure(e);
+    emit_scavenge(e);
+    e->gc_offset = x86_len(b);
+    u32 oom_patch[4]; int n_oom = 0;
+    x86_push(b, RBX); x86_push(b, RBP); x86_push(b, R14);
+    u32 flip = x86_len(b);
+    /* active ^= 1 */
+    emit_load_data(b, RAX, DATA_ACTIVE);
+    x86_mov_ri(b, RCX, 1);
+    x86_byte(b, 0x48); x86_byte(b, 0x31); x86_byte(b, 0xC8);  /* xor rax, rcx */
+    emit_store_data(b, DATA_ACTIVE, RAX);
+    /* to = space[active], from = space[1 - active] */
+    emit_load_data(b, R8, DATA_SPACE0);
+    emit_load_data(b, R9, DATA_SPACE1);
+    emit_load_data(b, R10, DATA_SPACE0_SIZE);
+    emit_load_data(b, R11, DATA_SPACE1_SIZE);
+    x86_cmp_ri(b, RAX, 0);
+    x86_mov_rr(b, RBX, R8);  emit_cmovne(b, RBX, R9);    /* to_base */
+    x86_mov_rr(b, RCX, R10); emit_cmovne(b, RCX, R11);   /* to_size */
+    x86_mov_rr(b, RBP, R9);  emit_cmovne(b, RBP, R8);    /* from_base */
+    x86_mov_rr(b, RDX, R11); emit_cmovne(b, RDX, R10);   /* from_size */
+    emit_store_data(b, DATA_FROM_BASE, RBP);
+    x86_add_rr(b, RDX, RBP);
+    emit_store_data(b, DATA_FROM_END, RDX);
+    x86_mov_rr(b, R12, RBX);                              /* hp = to_base */
+    x86_mov_rr(b, R13, RBX); x86_add_rr(b, R13, RCX);     /* limit = to_base + to_size */
+    emit_store_data(b, DATA_SCAN, RBX);                   /* Cheney scan starts at to_base */
+    /* roots */
+    static const int roots[3] = { DATA_GC_ROOT_K, DATA_GC_ROOT_SELF, DATA_GC_ROOT_VAL };
+    u32 rc[3];
+    for (int i = 0; i < 3; i++) {
+        emit_load_data(b, RDI, roots[i]);
+        x86_call_rel(b, 0); rc[i] = x86_len(b) - 4;
+        emit_store_data(b, roots[i], RAX);
+    }
+    /* Static area (ELF: the embedded term, whose thunks get updated to point
+     * into the heap): its closures never move, but their fields are roots. */
+    emit_load_data(b, RBX, DATA_STATIC_BEGIN);
+    u32 sscan = x86_len(b);
+    x86_cmp_rm(b, RBX, R15, DATA_STATIC_END);
+    u32 sscan_done = emit_jcc(b, CC_AE);
+    x86_call_rel(b, 0); u32 sv1 = x86_len(b) - 4;
+    emit_jmp_back(b, sscan);
+    x86_patch_rel32(b, sscan_done, x86_len(b));
+    /* Cheney scan: rbx = scan pointer, chases hp */
+    emit_load_data(b, RBX, DATA_SCAN);
+    u32 scan = x86_len(b);
+    x86_cmp_rr(b, RBX, R12);
+    u32 scan_done = emit_jcc(b, CC_AE);
+    x86_call_rel(b, 0); u32 sv2 = x86_len(b) - 4;
+    emit_jmp_back(b, scan);
+    x86_patch_rel32(b, scan_done, x86_len(b));
+    /* enough room for the pending request? */
+    emit_load_data(b, RAX, DATA_ALLOC_REQUEST);
+    x86_add_rr(b, RAX, R12);
+    x86_cmp_rr(b, RAX, R13);
+    u32 fits = emit_jcc(b, CC_BE);
+    /* grow: double the (empty) fromspace, then collect again into it */
+    emit_load_space_sizes(b);                             /* rcx = to_size, rdx = from_size */
+    x86_mov_rr(b, R8, RCX); x86_add_rr(b, R8, RCX);       /* new = 2 * to_size */
+    x86_cmp_rm(b, R8, R15, DATA_MAX_SPACE_SIZE);
+    oom_patch[n_oom++] = emit_jcc(b, CC_A);
+    emit_load_data(b, RDI, DATA_FROM_BASE);
+    x86_mov_rr(b, RSI, RDX);
+    x86_mov_rr(b, RDX, R8);
+    x86_mov_ri(b, R10, 1);                                /* MREMAP_MAYMOVE */
+    x86_push(b, R8);
+    x86_mov_ri(b, RAX, SYS_mremap);
+    emit_syscall(b);
+    x86_pop(b, R8);
+    x86_cmp_ri(b, RAX, 0);
+    u32 grow_ok = emit_jcc(b, CC_GE);
+    oom_patch[n_oom++] = x86_len(b) + 1; x86_jmp_rel(b, 0);
+    x86_patch_rel32(b, grow_ok, x86_len(b));
+    emit_store_from_space(b);
+    emit_jmp_back(b, flip);
+    /* fits: bring the (empty) fromspace up to the tospace size if a grow left them unequal */
+    x86_patch_rel32(b, fits, x86_len(b));
+    emit_load_space_sizes(b);                             /* rcx = to_size, rdx = from_size */
+    x86_cmp_rr(b, RDX, RCX);
+    u32 equal = emit_jcc(b, CC_AE);
+    emit_load_data(b, RDI, DATA_FROM_BASE);
+    x86_mov_rr(b, RSI, RDX);
+    x86_mov_rr(b, RDX, RCX);
+    x86_mov_ri(b, R10, 1);
+    x86_push(b, RCX);
+    x86_mov_ri(b, RAX, SYS_mremap);
+    emit_syscall(b);
+    x86_pop(b, R8);
+    x86_cmp_ri(b, RAX, 0);
+    u32 eq_ok = emit_jcc(b, CC_GE);
+    oom_patch[n_oom++] = x86_len(b) + 1; x86_jmp_rel(b, 0);
+    x86_patch_rel32(b, eq_ok, x86_len(b));
+    emit_store_from_space(b);
+    x86_patch_rel32(b, equal, x86_len(b));
+    /* done */
+    emit_store_data(b, DATA_HP, R12);
+    emit_store_data(b, DATA_LIMIT, R13);
+    x86_pop(b, R14); x86_pop(b, RBP); x86_pop(b, RBX);
+    x86_ret(b);
+    /* OOM: write "OOM\n" to stderr, exit 137 */
+    for (int i = 0; i < n_oom; i++) x86_patch_rel32(b, oom_patch[i], x86_len(b));
+    x86_push(b, RAX);
+    x86_mov_ri(b, RAX, 0x0A4D4F4F);
+    x86_mov_mr(b, RSP, 0, RAX);
+    x86_mov_ri(b, RAX, SYS_write);
+    x86_mov_ri(b, RDI, 2);
+    x86_mov_rr(b, RSI, RSP);
+    x86_mov_ri(b, RDX, 4);
+    emit_syscall(b);
+    x86_mov_ri(b, RAX, SYS_exit);
+    x86_mov_ri(b, RDI, 137);
+    emit_syscall(b);
+    /* subroutine calls */
+    for (int i = 0; i < 3; i++) x86_patch_rel32(b, rc[i], e->gc_copy_offset);
+    x86_patch_rel32(b, sv1, e->gc_scavenge_offset);
+    x86_patch_rel32(b, sv2, e->gc_scavenge_offset);
 }
 
 /* ========================================================================
@@ -1011,12 +799,21 @@ static void emit_start(NativeEmit *e) {
     /* Load runtime state into registers */
     emit_load_data(b, R12, DATA_HP);
     emit_load_data(b, R13, DATA_LIMIT);
-    
-    /* Set continuation to Halt singleton */
-    x86_lea(b, RBX, R15, DATA_HALT);
-    
-    /* Load root term from DATA_ROOT and enter it */
-    emit_load_data(b, RDI, DATA_ROOT);
+    x86_mov_ri(b, R14, 0);                      /* no value yet: the GC root must be clean */
+    x86_lea(b, RBX, R15, DATA_HALT);            /* k = Halt */
+    emit_load_data(b, RDI, DATA_ROOT);          /* the program */
+    /* NF mode: k = Norm[Halt]; WHNF mode: k = Halt */
+    u32 retry = x86_len(b);
+    emit_reserve(e, 2, retry);
+    emit_load_data(b, RAX, DATA_NF_MODE);
+    x86_cmp_ri(b, RAX, 0);
+    u32 whnf = emit_jcc(b, CC_E);
+    emit_bump(b, 2);
+    emit_get_entry(b, RSI, CLOS_NORM);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, RBX);
+    x86_mov_rr(b, RBX, RAX);
+    x86_patch_rel32(b, whnf, x86_len(b));
     emit_enter(b);
 }
 
@@ -1168,6 +965,22 @@ static void emit_flush_and_exit(X86Buf *b) {
 }
 
 /*
+ * Output helper: r10 = closure, rcx = closure, rdx = its entry pointer.
+ * Follow indirections (updated thunks) to the value they stand for.
+ */
+static void emit_follow_ind(X86Buf *b) {
+    u32 top = x86_len(b);
+    emit_get_entry(b, RAX, CLOS_IND);
+    x86_cmp_rr(b, RDX, RAX);
+    u32 skip = emit_jcc(b, CC_NE);
+    x86_mov_rm(b, R10, R10, 8);
+    x86_mov_rr(b, RCX, R10);
+    x86_mov_rm(b, RDX, RCX, 0);
+    emit_jmp_back(b, top);
+    x86_patch_rel32(b, skip, x86_len(b));
+}
+
+/*
  * BCL Output Routine
  *
  * BCL encoding: K=00, S=01, App(f,x)=1 + encode(f) + encode(x)
@@ -1238,6 +1051,7 @@ static void emit_output_bcl(NativeEmit *e) {
     
     /* Get entry pointer to determine type */
     x86_mov_rm(b, RDX, RCX, 0);  /* rdx = entry ptr */
+    emit_follow_ind(b);
     
     /* Check for S */
     emit_get_entry(b, RAX, CLOS_S);
@@ -1459,6 +1273,7 @@ static void emit_output_jot_impl(NativeEmit *e) {
     
     /* Get entry pointer to determine type */
     x86_mov_rm(b, RDX, RCX, 0);
+    emit_follow_ind(b);
     
     /* Check for S */
     emit_get_entry(b, RAX, CLOS_S);
@@ -1668,27 +1483,32 @@ static void emit_output(NativeEmit *e) {
  * Emit the complete runtime
  */
 void native_emit_runtime(NativeEmit *e) {
-    /* Emit all entry points */
+    /* Values */
     emit_entry_S(e);
     emit_entry_K(e);
     emit_entry_I(e);
     emit_entry_S1(e);
     emit_entry_S2(e);
     emit_entry_K1(e);
+    /* Thunks and continuations */
     emit_entry_App(e);
-    emit_entry_ApplyK1(e);
-    emit_entry_ApplyK2(e);
+    emit_entry_Ind(e);
+    emit_entry_ApplyK(e);
+    emit_entry_UpdK(e);
+    emit_entry_Norm(e);
+    emit_entry_Field1(e);
+    emit_entry_Field2(e);
     emit_entry_Halt(e);
     emit_entry_Fwd(e);
-    
-    /* Emit GC */
+    /* Collector (classify + copy_closure + gc) */
     emit_gc(e);
-    
-    /* Emit start */
+    /* Program entry */
     emit_start(e);
-    
-    /* Emit output serialization and patch Halt */
+    /* Output serialization; patches Halt's jump */
     emit_output(e);
+    /* Wire every reserve's `call gc` */
+    for (int i = 0; i < e->n_gc_call; i++)
+        x86_patch_rel32(&e->code, e->gc_call_patch[i], e->gc_offset);
 }
 
 /*
@@ -1752,6 +1572,11 @@ NativeJIT *native_jit_prepare(NativeEmit *e, u32 heap_size) {
     data[DATA_SPACE1 / 8] = (u64)jit->heap1;
     data[DATA_ACTIVE / 8] = 0;
     data[DATA_SPACE_SIZE / 8] = heap_size;
+    data[DATA_SPACE0_SIZE / 8] = heap_size;
+    data[DATA_SPACE1_SIZE / 8] = heap_size;
+    data[DATA_NF_MODE / 8] = e->nf_mode ? 1 : 0;
+    data[DATA_STATIC_BEGIN / 8] = 0;
+    data[DATA_STATIC_END / 8] = 0;
     data[DATA_HP / 8] = (u64)jit->heap0;
     data[DATA_LIMIT / 8] = (u64)jit->heap0 + heap_size;
     data[DATA_MAX_SPACE_SIZE / 8] = heap_size * 16;  /* Allow 16x growth */
@@ -2046,6 +1871,10 @@ static u32 emit_elf_start(NativeEmit *e, u32 heap_size) {
     x86_mov_mr(b, R15, DATA_OUTPUT_XOR, RAX);
     x86_mov_ri(b, RAX, heap_size);
     x86_mov_mr(b, R15, DATA_SPACE_SIZE, RAX);
+    x86_mov_mr(b, R15, DATA_SPACE0_SIZE, RAX);
+    x86_mov_mr(b, R15, DATA_SPACE1_SIZE, RAX);
+    x86_mov_ri(b, RAX, e->nf_mode ? 1 : 0);
+    x86_mov_mr(b, R15, DATA_NF_MODE, RAX);
     /* Max space size = heap_size * 16 (allow 16x growth) */
     x86_mov_ri(b, RAX, (u64)heap_size * 16);
     x86_mov_mr(b, R15, DATA_MAX_SPACE_SIZE, RAX);
@@ -2218,6 +2047,8 @@ void native_emit_elf(NativeEmit *e, u8 **out, u32 *out_size, SKITerm *term, u32 
     
     /* Set DATA_ROOT to point to the embedded term */
     d[DATA_ROOT / 8] = root_vaddr;
+    d[DATA_STATIC_BEGIN / 8] = term_buf_vaddr;
+    d[DATA_STATIC_END / 8] = term_buf_vaddr + term_hp;
     
     /* Calculate total file size */
     u32 total_size = header_size + code_size + data_size;
