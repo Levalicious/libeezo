@@ -54,9 +54,14 @@ void ski_unref(SKIPool *p, SKITerm *t);
 /* Deep copy */
 SKITerm *ski_copy(SKIPool *p, SKITerm *t);
 
-/* Reduction (leftmost-outermost, lazy) */
+/* Reduction (normal order: leftmost-outermost).
+ * ski_reduce: to full normal form (reduces inside arguments too).
+ * ski_reduce_mode(..., whnf=true): head reduction only, stops at weak
+ * head normal form. Returns steps taken, -1 on error. */
 i64 ski_reduce(SKIPool *p, SKITerm **t, u64 max_steps);
-bool ski_is_hnf(SKITerm *t);
+i64 ski_reduce_mode(SKIPool *p, SKITerm **t, u64 max_steps, bool whnf);
+bool ski_is_nf(SKITerm *t);     /* no redex anywhere */
+bool ski_is_whnf(SKITerm *t);   /* no redex on the head spine */
 
 /* Comparison */
 bool ski_equal(SKITerm *a, SKITerm *b);
