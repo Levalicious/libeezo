@@ -1,3 +1,4 @@
+#include "res.h"
 /*
  * native.c - Native code generation for CPS SKI
  *
@@ -2523,7 +2524,7 @@ void native_emit_elf(NativeEmit *e, u8 **out, u32 *out_size, SKITerm *term, u32 
     u32 total_size = header_size + code_size + data_size;
     
     /* Allocate output buffer */
-    u8 *elf = malloc(total_size);
+    u8 *elf = rmalloc(total_size);
     if (!elf) {
         free(data);
         *out = NULL;

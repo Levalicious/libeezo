@@ -1,3 +1,4 @@
+#include "res.h"
 /*
  * jomplement.c - Jomplement and Jot parsing and emission
  *
@@ -152,7 +153,7 @@ SKITerm *jomplement_parse(SKIPool *p, BclStream *s) {
     u64 nbits = s->len - s->pos;
     if (nbits == 0) return ski_i(p);
     
-    u8 *bits = malloc((nbits + 7) / 8);
+    u8 *bits = rmalloc((nbits + 7) / 8);
     if (!bits) return NULL;
     
     for (u64 i = 0; i < nbits; i++) {
@@ -224,7 +225,7 @@ SKITerm *jot_parse(SKIPool *p, BclStream *s) {
     u64 nbits = s->len - s->pos;
     if (nbits == 0) return ski_i(p);
     
-    u8 *bits = malloc((nbits + 7) / 8);
+    u8 *bits = rmalloc((nbits + 7) / 8);
     if (!bits) return NULL;
     
     for (u64 i = 0; i < nbits; i++) {

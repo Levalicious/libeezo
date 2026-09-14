@@ -4,6 +4,7 @@ LIB=libeezo.a
 
 OFILES=\
 	term.$O\
+	res.$O\
 	bcl.$O\
 	jomplement.$O\
 	x86.$O\
@@ -12,6 +13,7 @@ OFILES=\
 HFILES=\
 	types.h\
 	term.h\
+	res.h\
 	bcl.h\
 	jomplement.h\
 	x86.h\

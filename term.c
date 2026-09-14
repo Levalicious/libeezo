@@ -1,3 +1,4 @@
+#include "res.h"
 /*
  * term.c - SKI combinator term implementation
  */
@@ -10,7 +11,7 @@
  */
 
 void pool_init(SKIPool *p, u32 capacity) {
-    p->pool = calloc(capacity, sizeof(SKITerm));
+    p->pool = rcalloc(capacity, sizeof(SKITerm));
     p->capacity = capacity;
     p->next_free = 0;
     p->freelist = NULL;
