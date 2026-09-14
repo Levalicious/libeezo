@@ -240,6 +240,10 @@ typedef struct {
     u32 start_offset;       /* offset of _start within code */
 } NativeJIT;
 
+/* Default initial semispace (bytes); -H overrides it in eezo and eezoc */
+#define NATIVE_DEFAULT_HEAP_SIZE (16u * 1024 * 1024)
+/* Growth ceiling of one semispace for an initial size of heap_size */
+u64 native_max_space(u32 heap_size);
 NativeJIT *native_jit_prepare(NativeEmit *e, u32 heap_size);
 void native_jit_free(NativeJIT *jit);
 

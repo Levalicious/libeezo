@@ -1879,6 +1879,20 @@ u32 native_get_entry(NativeEmit *e) {
  * JIT EXECUTION
  * ======================================================================== */
 
+static u32 calc_term_size(SKITerm *term);
+
+/*
+ * The growth ceiling of one semispace. -H sets the INITIAL size only: a
+ * small initial heap (chosen to exercise the grow path) must not lower the
+ * ceiling below what a default run gets, so the ceiling is 16x the larger
+ * of the two.
+ */
+u64 native_max_space(u32 heap_size) {
+    u64 m = (u64)heap_size * 16;
+    u64 d = (u64)NATIVE_DEFAULT_HEAP_SIZE * 16;
+    return m > d ? m : d;
+}
+
 NativeJIT *native_jit_prepare(NativeEmit *e, u32 heap_size) {
     NativeJIT *jit = calloc(1, sizeof(NativeJIT));
     if (!jit) return NULL;
@@ -1937,7 +1951,7 @@ NativeJIT *native_jit_prepare(NativeEmit *e, u32 heap_size) {
     data[DATA_KI / 8 + 1] = (u64)jit->data + DATA_PRIM_I;
     data[DATA_HP / 8] = (u64)jit->heap0;
     data[DATA_LIMIT / 8] = (u64)jit->heap0 + heap_size;
-    data[DATA_MAX_SPACE_SIZE / 8] = heap_size * 16;  /* Allow 16x growth */
+    data[DATA_MAX_SPACE_SIZE / 8] = native_max_space(heap_size);
     data[DATA_ALLOC_REQUEST / 8] = 0;
     data[DATA_OUTPUT_XOR / 8] = (e->output_fmt == OUTPUT_JOMPLEMENT) ? 1 : 0;
     
@@ -2022,17 +2036,46 @@ static u64 build_term_recursive(NativeJIT *jit, SKITerm *term, u8 **hp_ptr) {
  * Build term on heap and set up for execution.
  * Returns 0 on success, -1 on failure (e.g., term too large).
  */
-int native_jit_load_term(NativeJIT *jit, SKITerm *term) {
-    u8 *hp = (u8*)jit->heap0;
-    u8 *limit = hp + jit->heap_size;
-    
-    /* Build the term */
-    u64 root = build_term_recursive(jit, term, &hp);
-    
-    /* Check we didn't overflow */
-    if (hp > limit) {
+/*
+ * The heaps must hold the initial program before anything runs. Size them
+ * to the term - a power of two with as much again to work in - remapping
+ * the spaces native_jit_prepare made if they are too small.
+ */
+static int jit_size_heaps(NativeJIT *jit, u32 need) {
+    u64 want = jit->heap_size;
+    while (want < (u64)need * 2) want *= 2;
+    if (want > 0xFFFFFFFFull) return -1;
+    if (want == jit->heap_size) return 0;
+    void *h0 = mmap(NULL, want, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void *h1 = mmap(NULL, want, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (h0 == MAP_FAILED || h1 == MAP_FAILED) {
+        if (h0 != MAP_FAILED) munmap(h0, want);
+        if (h1 != MAP_FAILED) munmap(h1, want);
         return -1;
     }
+    munmap(jit->heap0, jit->heap_size);
+    munmap(jit->heap1, jit->heap_size);
+    jit->heap0 = h0;
+    jit->heap1 = h1;
+    jit->heap_size = (u32)want;
+    u64 *data = (u64*)jit->data;
+    data[DATA_SPACE0 / 8] = (u64)h0;
+    data[DATA_SPACE1 / 8] = (u64)h1;
+    data[DATA_SPACE_SIZE / 8] = want;
+    data[DATA_SPACE0_SIZE / 8] = want;
+    data[DATA_SPACE1_SIZE / 8] = want;
+    data[DATA_HP / 8] = (u64)h0;
+    data[DATA_LIMIT / 8] = (u64)h0 + want;
+    data[DATA_MAX_SPACE_SIZE / 8] = native_max_space((u32)want);
+    return 0;
+}
+
+int native_jit_load_term(NativeJIT *jit, SKITerm *term) {
+    /* Never write past the space: size it first, then build */
+    u32 need = calc_term_size(term);
+    if (jit_size_heaps(jit, need) != 0 || need > jit->heap_size) return -1;
+    u8 *hp = (u8*)jit->heap0;
+    u64 root = build_term_recursive(jit, term, &hp);
     
     /* Update heap pointer in data section */
     u64 *data = (u64*)jit->data;
@@ -2238,8 +2281,7 @@ static u32 emit_elf_start(NativeEmit *e, u32 heap_size) {
     x86_mov_mr(b, R15, DATA_NF_MODE, RAX);
     x86_mov_ri(b, RAX, e->io_mode ? 1 : 0);
     x86_mov_mr(b, R15, DATA_IO_MODE, RAX);
-    /* Max space size = heap_size * 16 (allow 16x growth) */
-    x86_mov_ri(b, RAX, (u64)heap_size * 16);
+    x86_mov_ri(b, RAX, native_max_space(heap_size));
     x86_mov_mr(b, R15, DATA_MAX_SPACE_SIZE, RAX);
     
     /* Entry table is already in data section (baked in) */
