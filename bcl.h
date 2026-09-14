@@ -73,4 +73,19 @@ bool bcl_emit(SKITerm *t, BclBuffer *b);
  */
 u64 bcl_size(SKITerm *t);
 
+/*
+ * XBCL: BCL with the extended leaves (2026-09-13).
+ *   1 X Y         App(X, Y)
+ *   00            K
+ *   010           S
+ *   011 ccccc     a leaf by 5-bit code: 0 I, 1 B, 2 C, 3 T, 4 R,
+ *                 5 a word (followed by its 64 bits, most significant first),
+ *                 6 + op a primitive (op as in PrimOp)
+ * Pure BCL has no free codepoint, so this is a format of its own; the pure
+ * formats spell B C T R as their S K trees and cannot spell words at all.
+ */
+SKITerm *xbcl_parse(SKIPool *p, BclStream *s);
+bool xbcl_emit(SKITerm *t, BclBuffer *b);
+u64 xbcl_size(SKITerm *t);
+
 #endif /* EEZO_BCL_H */
