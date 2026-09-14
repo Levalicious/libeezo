@@ -40,6 +40,21 @@ typedef enum {
     CLOS_ION,       /* IoN[v, count] - unfolds the K1 spine; on S emits the byte, moves to the tail */
     CLOS_HALT,      /* Halt continuation - jumps to output routine */
     CLOS_FWD,       /* Forwarding pointer (during GC) */
+    /* The extended leaves (2026-09-13, term.h) */
+    CLOS_B,         /* B combinator (singleton) */
+    CLOS_C,         /* C combinator (singleton) */
+    CLOS_T,         /* T combinator (singleton) */
+    CLOS_R,         /* R combinator (singleton) */
+    CLOS_B1,        /* B x */
+    CLOS_B2,        /* B x y */
+    CLOS_C1,        /* C x */
+    CLOS_C2,        /* C x y */
+    CLOS_T1,        /* T x */
+    CLOS_R1,        /* R x */
+    CLOS_R2,        /* R x y */
+    CLOS_WORD,      /* Word[w] - a machine word (w is not a pointer) */
+    CLOS_PRIM,      /* Prim[op] - a word primitive (one singleton per op; op is not a pointer) */
+    CLOS_PRIM1,     /* Prim1[x, op] - the primitive applied to x */
     CLOS_COUNT
 } ClosureType;
 
@@ -51,6 +66,7 @@ typedef enum {
     OUTPUT_BCL,         /* Binary Combinatory Logic: S=01, K=00, App=1 */
     OUTPUT_JOT,         /* Jot encoding */
     OUTPUT_JOMPLEMENT,  /* Jomplement encoding */
+    OUTPUT_XBCL         /* BCL with the extended leaves (bcl.h) */
 } OutputFormat;
 
 /*
@@ -75,6 +91,11 @@ static const int CLOS_SIZES[CLOS_COUNT] = {
     3,  /* ION: entry + v + count (an unboxed small integer; the collector leaves it alone) */
     1,  /* HALT */
     2,  /* FWD: entry + target */
+    1, 1, 1, 1,             /* B C T R */
+    2, 3, 2, 3, 2, 2, 3,    /* B1 B2 C1 C2 T1 R1 R2 */
+    2,  /* WORD: entry + the word */
+    2,  /* PRIM: entry + op */
+    3,  /* PRIM1: entry + x + op */
 };
 
 /* Pointer counts for GC (excludes entry ptr itself) */
@@ -97,6 +118,11 @@ static const int CLOS_PTRS[CLOS_COUNT] = {
     2,  /* ION (count is outside every semispace, so copy_closure returns it unchanged) */
     0,  /* HALT */
     1,  /* FWD */
+    0, 0, 0, 0,             /* B C T R */
+    1, 2, 1, 2, 1, 1, 2,    /* B1 B2 C1 C2 T1 R1 R2 */
+    0,  /* WORD */
+    0,  /* PRIM */
+    1,  /* PRIM1: x only; op is a datum */
 };
 
 /*
@@ -146,7 +172,12 @@ static const int CLOS_PTRS[CLOS_COUNT] = {
 #define DATA_PRIM_K         (DATA_PRIM_S + 8)
 #define DATA_PRIM_I         (DATA_PRIM_K + 8)
 #define DATA_HALT           (DATA_PRIM_I + 8)
-#define DATA_SECTION_SIZE   (DATA_HALT + 8)
+#define DATA_PRIM_B         (DATA_HALT + 8)
+#define DATA_PRIM_C         (DATA_PRIM_B + 8)
+#define DATA_PRIM_T         (DATA_PRIM_C + 8)
+#define DATA_PRIM_R         (DATA_PRIM_T + 8)
+#define DATA_PRIM_OPS       (DATA_PRIM_R + 8)               /* PRIM_COUNT singletons [entry_Prim, op], 16 bytes each */
+#define DATA_SECTION_SIZE   (DATA_PRIM_OPS + 16 * PRIM_COUNT)
 
 /*
  * Register convention (during CPS execution):

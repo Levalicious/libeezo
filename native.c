@@ -75,21 +75,6 @@ static void emit_get_entry(X86Buf *b, X86Reg dst, ClosureType type) {
 }
 
 /*
- * Emit: get singleton closure address (S, K, I, or Halt)
- */
-static void emit_get_singleton(X86Buf *b, X86Reg dst, ClosureType type) {
-    int offset;
-    switch (type) {
-        case CLOS_S: offset = DATA_PRIM_S; break;
-        case CLOS_K: offset = DATA_PRIM_K; break;
-        case CLOS_I: offset = DATA_PRIM_I; break;
-        case CLOS_HALT: offset = DATA_HALT; break;
-        default: offset = DATA_PRIM_S; break;
-    }
-    x86_lea(b, dst, R15, offset);
-}
-
-/*
  * Conditional jump rel32 with a patchable displacement.
  * Returns the offset of the rel32 (pass to x86_patch_rel32).
  */
@@ -118,6 +103,46 @@ static void emit_cmovne(X86Buf *b, X86Reg dst, X86Reg src) {
 /* jmp to an already-emitted offset */
 static void emit_jmp_back(X86Buf *b, u32 target) {
     x86_jmp_rel(b, (i32)target - (i32)(x86_len(b) + 5));
+}
+
+/* Word arithmetic (2026-09-13): REX.W op r/m64, r64 with op = add 01, sub 29, and 21, or 09, xor 31 */
+static void emit_alu_rr(X86Buf *b, u8 op, X86Reg dst, X86Reg src) {
+    x86_byte(b, 0x48 | (((src >> 3) & 1) << 2) | ((dst >> 3) & 1));
+    x86_byte(b, op);
+    x86_byte(b, 0xC0 | ((src & 7) << 3) | (dst & 7));
+}
+static void emit_imul_rr(X86Buf *b, X86Reg dst, X86Reg src) {          /* dst = low 64 bits of dst * src */
+    x86_byte(b, 0x48 | (((dst >> 3) & 1) << 2) | ((src >> 3) & 1));
+    x86_byte(b, 0x0F); x86_byte(b, 0xAF);
+    x86_byte(b, 0xC0 | ((dst & 7) << 3) | (src & 7));
+}
+static void emit_mul_rcx(X86Buf *b) { x86_byte(b, 0x48); x86_byte(b, 0xF7); x86_byte(b, 0xE1); }   /* rdx:rax = rax * rcx */
+static void emit_div_rcx(X86Buf *b) { x86_byte(b, 0x48); x86_byte(b, 0xF7); x86_byte(b, 0xF1); }   /* rax = rdx:rax / rcx, rdx = the remainder */
+static void emit_shl_rax_cl(X86Buf *b) { x86_byte(b, 0x48); x86_byte(b, 0xD3); x86_byte(b, 0xE0); }
+static void emit_shr_rax_cl(X86Buf *b) { x86_byte(b, 0x48); x86_byte(b, 0xD3); x86_byte(b, 0xE8); }
+static void emit_shl_ri(X86Buf *b, X86Reg r, u8 imm) { x86_byte(b, 0x48 | ((r >> 3) & 1)); x86_byte(b, 0xC1); x86_byte(b, 0xE0 | (r & 7)); x86_byte(b, imm); }
+static void emit_shr_ri(X86Buf *b, X86Reg r, u8 imm) { x86_byte(b, 0x48 | ((r >> 3) & 1)); x86_byte(b, 0xC1); x86_byte(b, 0xE8 | (r & 7)); x86_byte(b, imm); }
+static void emit_setcc_al(X86Buf *b, u8 cc) { x86_byte(b, 0x0F); x86_byte(b, cc); x86_byte(b, 0xC0); }   /* cc: 0x92 setb, 0x94 sete */
+static void emit_movzx_eax_al(X86Buf *b) { x86_byte(b, 0x0F); x86_byte(b, 0xB6); x86_byte(b, 0xC0); }
+static void emit_xor_edx_edx(X86Buf *b) { x86_byte(b, 0x31); x86_byte(b, 0xD2); }
+
+/* Follow indirections from the closure in `reg`; leaves its entry pointer in RSI. Clobbers RAX. */
+static void emit_follow_ind_reg(X86Buf *b, X86Reg reg) {
+    u32 top = x86_len(b);
+    x86_mov_rm(b, RSI, reg, 0);
+    emit_get_entry(b, RAX, CLOS_IND);
+    x86_cmp_rr(b, RSI, RAX);
+    u32 out = emit_jcc(b, CC_NE);
+    x86_mov_rm(b, reg, reg, 8);
+    emit_jmp_back(b, top);
+    x86_patch_rel32(b, out, x86_len(b));
+}
+
+/* The address of the Prim[op] singleton for the op in `reg` (clobbers it): reg = r15 + DATA_PRIM_OPS + 16 * op */
+static void emit_prim_singleton(X86Buf *b, X86Reg reg) {
+    emit_shl_ri(b, reg, 4);
+    x86_add_rr(b, reg, R15);
+    x86_add_ri(b, reg, DATA_PRIM_OPS);
 }
 
 /*
@@ -247,6 +272,17 @@ static void emit_entry_K1(NativeEmit *e) {
 }
 
 /*
+ * A value's entry: call the continuation with self. The extended leaves and
+ * their partial applications are all values.
+ */
+static void emit_entry_value(NativeEmit *e, ClosureType t) {
+    X86Buf *b = &e->code;
+    e->entry_offsets[t] = x86_len(b);
+    x86_mov_rr(b, R14, RDI);
+    emit_call_cont(b);
+}
+
+/*
  * Entry for App[f, x] - a THUNK (not a value)
  *
  *   eval(App[f,x], k) = eval(f, ApplyK[x, UpdK[self, k]])
@@ -334,9 +370,13 @@ static void emit_entry_ApplyK(NativeEmit *e) {
     x86_mov_rm(b, RCX, RDI, 8);             /* x */
     x86_mov_rm(b, RDX, RDI, 16);            /* k */
     x86_mov_rm(b, RSI, R14, 0);             /* f_val entry */
-    static const ClosureType cases[] = { CLOS_S, CLOS_K, CLOS_I, CLOS_S1, CLOS_S2, CLOS_K1 };
-    u32 p[6];
-    emit_dispatch(b, cases, 6, p);
+    static const ClosureType cases[] = {
+        CLOS_S, CLOS_K, CLOS_I, CLOS_S1, CLOS_S2, CLOS_K1,
+        CLOS_B, CLOS_C, CLOS_T, CLOS_R, CLOS_B1, CLOS_C1, CLOS_R1, CLOS_B2, CLOS_C2, CLOS_T1, CLOS_R2,
+        CLOS_WORD, CLOS_PRIM, CLOS_PRIM1
+    };
+    u32 p[20];
+    emit_dispatch(b, cases, 20, p);
     x86_int3(b);                            /* a non-value reached a continuation */
     /* S x -> k(S1[x]) */
     x86_patch_rel32(b, p[0], x86_len(b));
@@ -400,6 +440,289 @@ static void emit_entry_ApplyK(NativeEmit *e) {
     x86_mov_rm(b, RDI, R14, 8);
     x86_mov_rr(b, RBX, RDX);
     emit_enter(b);
+    
+    /* ---- the extended leaves (term.h); rcx = x (unevaluated), rdx = k, r14 = the function value ---- */
+    /* B x, C x, T x, R x -> k(PAP1[x]) */
+    static const ClosureType pap1_of[] = { CLOS_B1, CLOS_C1, CLOS_T1, CLOS_R1 };
+    for (int i = 0; i < 4; i++) {
+        x86_patch_rel32(b, p[6 + i], x86_len(b));
+        emit_bump(b, 2);
+        emit_get_entry(b, RSI, pap1_of[i]);
+        x86_mov_mr(b, RAX, 0, RSI);
+        x86_mov_mr(b, RAX, 8, RCX);
+        x86_mov_rr(b, R14, RAX);
+        x86_mov_rr(b, RBX, RDX);
+        emit_call_cont(b);
+    }
+    /* B1[a] x, C1[a] x, R1[a] x -> k(PAP2[a, x]) */
+    static const ClosureType pap2_of[] = { CLOS_B2, CLOS_C2, CLOS_R2 };
+    for (int i = 0; i < 3; i++) {
+        x86_patch_rel32(b, p[10 + i], x86_len(b));
+        x86_mov_rm(b, R8, R14, 8);
+        emit_bump(b, 3);
+        emit_get_entry(b, RSI, pap2_of[i]);
+        x86_mov_mr(b, RAX, 0, RSI);
+        x86_mov_mr(b, RAX, 8, R8);
+        x86_mov_mr(b, RAX, 16, RCX);
+        x86_mov_rr(b, R14, RAX);
+        x86_mov_rr(b, RBX, RDX);
+        emit_call_cont(b);
+    }
+    /* B2[a,b] z -> eval(a, ApplyK[App[b,z], k])   (= a (b z)) */
+    x86_patch_rel32(b, p[13], x86_len(b));
+    x86_mov_rm(b, R8, R14, 8);
+    x86_mov_rm(b, R9, R14, 16);
+    emit_bump(b, 3);
+    emit_get_entry(b, RSI, CLOS_APP);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, R9);
+    x86_mov_mr(b, RAX, 16, RCX);
+    x86_mov_rr(b, R10, RAX);
+    emit_bump(b, 3);
+    emit_get_entry(b, RSI, CLOS_APPLYK);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, R10);
+    x86_mov_mr(b, RAX, 16, RDX);
+    x86_mov_rr(b, RBX, RAX);
+    x86_mov_rr(b, RDI, R8);
+    emit_enter(b);
+    /* C2[a,b] z -> eval(a, ApplyK[z, ApplyK[b, k]])   (= a z b) */
+    x86_patch_rel32(b, p[14], x86_len(b));
+    x86_mov_rm(b, R8, R14, 8);
+    x86_mov_rm(b, R9, R14, 16);
+    emit_bump(b, 3);
+    emit_get_entry(b, RSI, CLOS_APPLYK);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, R9);
+    x86_mov_mr(b, RAX, 16, RDX);
+    x86_mov_rr(b, R11, RAX);
+    emit_bump(b, 3);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, RCX);
+    x86_mov_mr(b, RAX, 16, R11);
+    x86_mov_rr(b, RBX, RAX);
+    x86_mov_rr(b, RDI, R8);
+    emit_enter(b);
+    /* T1[a] f -> eval(f, ApplyK[a, k])   (= f a) */
+    x86_patch_rel32(b, p[15], x86_len(b));
+    x86_mov_rm(b, R8, R14, 8);
+    emit_bump(b, 3);
+    emit_get_entry(b, RSI, CLOS_APPLYK);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, R8);
+    x86_mov_mr(b, RAX, 16, RDX);
+    x86_mov_rr(b, RBX, RAX);
+    x86_mov_rr(b, RDI, RCX);
+    emit_enter(b);
+    /* R2[a,b] z -> eval(b, ApplyK[z, ApplyK[a, k]])   (= b z a) */
+    x86_patch_rel32(b, p[16], x86_len(b));
+    x86_mov_rm(b, R8, R14, 8);
+    x86_mov_rm(b, R9, R14, 16);
+    emit_bump(b, 3);
+    emit_get_entry(b, RSI, CLOS_APPLYK);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, R8);
+    x86_mov_mr(b, RAX, 16, RDX);
+    x86_mov_rr(b, R11, RAX);
+    emit_bump(b, 3);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, RCX);
+    x86_mov_mr(b, RAX, 16, R11);
+    x86_mov_rr(b, RBX, RAX);
+    x86_mov_rr(b, RDI, R9);
+    emit_enter(b);
+    /* Word[w] f -> eval(f, ApplyK[self, k])   (= f #w) */
+    x86_patch_rel32(b, p[17], x86_len(b));
+    emit_bump(b, 3);
+    emit_get_entry(b, RSI, CLOS_APPLYK);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, R14);
+    x86_mov_mr(b, RAX, 16, RDX);
+    x86_mov_rr(b, RBX, RAX);
+    x86_mov_rr(b, RDI, RCX);
+    emit_enter(b);
+    /* Prim[op] x -> k(Prim1[x, op]) */
+    x86_patch_rel32(b, p[18], x86_len(b));
+    x86_mov_rm(b, R8, R14, 8);
+    emit_bump(b, 3);
+    emit_get_entry(b, RSI, CLOS_PRIM1);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, RCX);
+    x86_mov_mr(b, RAX, 16, R8);
+    x86_mov_rr(b, R14, RAX);
+    x86_mov_rr(b, RBX, RDX);
+    emit_call_cont(b);
+    /* Prim1[x, op] y: the three rules of term.h */
+    x86_patch_rel32(b, p[19], x86_len(b));
+    x86_mov_rm(b, R8, R14, 8);                  /* x */
+    emit_follow_ind_reg(b, R8);
+    emit_get_entry(b, RAX, CLOS_WORD);
+    x86_cmp_rr(b, RSI, RAX);
+    u32 rule2 = emit_jcc(b, CC_NE);
+    x86_mov_rr(b, R9, RCX);                     /* y */
+    emit_follow_ind_reg(b, R9);
+    emit_get_entry(b, RAX, CLOS_WORD);
+    x86_cmp_rr(b, RSI, RAX);
+    u32 rule3 = emit_jcc(b, CC_NE);
+    /* both words: compute. rax = a, rcx = b, r10 = op, r11 = k */
+    x86_mov_rm(b, R10, R14, 16);
+    x86_mov_rm(b, RAX, R8, 8);
+    x86_mov_rm(b, RCX, R9, 8);
+    x86_mov_rr(b, R11, RDX);
+    u32 opj[PRIM_COUNT];
+    for (int op = 0; op < PRIM_COUNT; op++) {
+        x86_cmp_ri(b, R10, op);
+        opj[op] = emit_jcc(b, CC_E);
+    }
+    x86_int3(b);
+    u32 to_word[10], to_bool[2], to_pair[5];
+    int nw = 0, nb = 0, np = 0;
+    /* ADD SUB MUL AND OR XOR: rax = a op b */
+    static const u8 alu[] = { 0x01, 0x29, 0, 0x21, 0x09, 0x31 };
+    for (int op = PRIM_ADD; op <= PRIM_XOR; op++) {
+        x86_patch_rel32(b, opj[op], x86_len(b));
+        if (op == PRIM_MUL) emit_imul_rr(b, RAX, RCX); else emit_alu_rr(b, alu[op], RAX, RCX);
+        to_word[nw++] = x86_len(b) + 1; x86_jmp_rel(b, 0);
+    }
+    /* SHL SHR: a count of 64 or more gives 0 */
+    for (int op = PRIM_SHL; op <= PRIM_SHR; op++) {
+        x86_patch_rel32(b, opj[op], x86_len(b));
+        x86_cmp_ri(b, RCX, 64);
+        u32 big = emit_jcc(b, CC_AE);
+        if (op == PRIM_SHL) emit_shl_rax_cl(b); else emit_shr_rax_cl(b);
+        to_word[nw++] = x86_len(b) + 1; x86_jmp_rel(b, 0);
+        x86_patch_rel32(b, big, x86_len(b));
+        x86_mov_ri(b, RAX, 0);
+        to_word[nw++] = x86_len(b) + 1; x86_jmp_rel(b, 0);
+    }
+    /* EQ LT: rax = 0 or 1 */
+    x86_patch_rel32(b, opj[PRIM_EQ], x86_len(b));
+    x86_cmp_rr(b, RAX, RCX);
+    emit_setcc_al(b, 0x94);
+    emit_movzx_eax_al(b);
+    to_bool[nb++] = x86_len(b) + 1; x86_jmp_rel(b, 0);
+    x86_patch_rel32(b, opj[PRIM_LT], x86_len(b));
+    x86_cmp_rr(b, RAX, RCX);
+    emit_setcc_al(b, 0x92);
+    emit_movzx_eax_al(b);
+    to_bool[nb++] = x86_len(b) + 1; x86_jmp_rel(b, 0);
+    /* ADDC: (a + b, carry) */
+    x86_patch_rel32(b, opj[PRIM_ADDC], x86_len(b));
+    x86_mov_rr(b, RDX, RAX);
+    emit_alu_rr(b, 0x01, RAX, RCX);
+    x86_mov_rr(b, R8, RAX);
+    x86_cmp_rr(b, RAX, RDX);
+    emit_setcc_al(b, 0x92);
+    emit_movzx_eax_al(b);
+    x86_mov_rr(b, R9, RAX);
+    to_pair[np++] = x86_len(b) + 1; x86_jmp_rel(b, 0);
+    /* SUBB: (a - b, borrow) */
+    x86_patch_rel32(b, opj[PRIM_SUBB], x86_len(b));
+    x86_mov_rr(b, RDX, RAX);
+    emit_alu_rr(b, 0x29, RAX, RCX);
+    x86_mov_rr(b, R8, RAX);
+    x86_cmp_rr(b, RDX, RCX);
+    emit_setcc_al(b, 0x92);
+    emit_movzx_eax_al(b);
+    x86_mov_rr(b, R9, RAX);
+    to_pair[np++] = x86_len(b) + 1; x86_jmp_rel(b, 0);
+    /* MULL: (low, high) of the 128-bit product */
+    x86_patch_rel32(b, opj[PRIM_MULL], x86_len(b));
+    emit_mul_rcx(b);
+    x86_mov_rr(b, R8, RAX);
+    x86_mov_rr(b, R9, RDX);
+    to_pair[np++] = x86_len(b) + 1; x86_jmp_rel(b, 0);
+    /* DIVMOD: (a / b, a % b); (0, a) when b = 0 */
+    x86_patch_rel32(b, opj[PRIM_DIVMOD], x86_len(b));
+    x86_cmp_ri(b, RCX, 0);
+    u32 by_zero = emit_jcc(b, CC_E);
+    emit_xor_edx_edx(b);
+    emit_div_rcx(b);
+    x86_mov_rr(b, R8, RAX);
+    x86_mov_rr(b, R9, RDX);
+    to_pair[np++] = x86_len(b) + 1; x86_jmp_rel(b, 0);
+    x86_patch_rel32(b, by_zero, x86_len(b));
+    x86_mov_rr(b, R9, RAX);
+    x86_mov_ri(b, R8, 0);
+    to_pair[np++] = x86_len(b) + 1; x86_jmp_rel(b, 0);
+    /* k(Word[rax]) */
+    for (int i = 0; i < nw; i++) x86_patch_rel32(b, to_word[i], x86_len(b));
+    x86_mov_rr(b, R8, RAX);
+    emit_bump(b, 2);
+    emit_get_entry(b, RSI, CLOS_WORD);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, R8);
+    x86_mov_rr(b, R14, RAX);
+    x86_mov_rr(b, RBX, R11);
+    emit_call_cont(b);
+    /* k(K) or k(K1[I]) */
+    for (int i = 0; i < nb; i++) x86_patch_rel32(b, to_bool[i], x86_len(b));
+    x86_cmp_ri(b, RAX, 0);
+    u32 is_false = emit_jcc(b, CC_E);
+    x86_lea(b, R14, R15, DATA_PRIM_K);
+    x86_mov_rr(b, RBX, R11);
+    emit_call_cont(b);
+    x86_patch_rel32(b, is_false, x86_len(b));
+    emit_bump(b, 2);
+    emit_get_entry(b, RSI, CLOS_K1);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_lea(b, RCX, R15, DATA_PRIM_I);
+    x86_mov_mr(b, RAX, 8, RCX);
+    x86_mov_rr(b, R14, RAX);
+    x86_mov_rr(b, RBX, R11);
+    emit_call_cont(b);
+    /* k(C2[T1[Word[r8]], Word[r9]])   (= the Scott pair \p. p r8 r9) */
+    for (int i = 0; i < np; i++) x86_patch_rel32(b, to_pair[i], x86_len(b));
+    emit_bump(b, 2);
+    emit_get_entry(b, RSI, CLOS_WORD);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, R8);
+    x86_mov_rr(b, R10, RAX);
+    emit_bump(b, 2);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, R9);
+    x86_mov_rr(b, RCX, RAX);
+    emit_bump(b, 2);
+    emit_get_entry(b, RSI, CLOS_T1);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, R10);
+    x86_mov_rr(b, R10, RAX);
+    emit_bump(b, 3);
+    emit_get_entry(b, RSI, CLOS_C2);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, R10);
+    x86_mov_mr(b, RAX, 16, RCX);
+    x86_mov_rr(b, R14, RAX);
+    x86_mov_rr(b, RBX, R11);
+    emit_call_cont(b);
+    /* op x y -> eval(x, ApplyK[B2[y, Prim[op]], k]) */
+    x86_patch_rel32(b, rule2, x86_len(b));
+    x86_mov_rm(b, R10, R14, 16);
+    emit_prim_singleton(b, R10);
+    emit_bump(b, 3);
+    emit_get_entry(b, RSI, CLOS_B2);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, RCX);
+    x86_mov_mr(b, RAX, 16, R10);
+    x86_mov_rr(b, R9, RAX);
+    emit_bump(b, 3);
+    emit_get_entry(b, RSI, CLOS_APPLYK);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, R9);
+    x86_mov_mr(b, RAX, 16, RDX);
+    x86_mov_rr(b, RBX, RAX);
+    x86_mov_rr(b, RDI, R8);
+    emit_enter(b);
+    /* op #a y -> eval(y, ApplyK[self, k])   (= y (op #a)) */
+    x86_patch_rel32(b, rule3, x86_len(b));
+    emit_bump(b, 3);
+    emit_get_entry(b, RSI, CLOS_APPLYK);
+    x86_mov_mr(b, RAX, 0, RSI);
+    x86_mov_mr(b, RAX, 8, R14);
+    x86_mov_mr(b, RAX, 16, RDX);
+    x86_mov_rr(b, RBX, RAX);
+    x86_mov_rr(b, RDI, R9);
+    emit_enter(b);
 }
 
 /*
@@ -419,18 +742,18 @@ static void emit_entry_Norm(NativeEmit *e) {
     emit_reserve(e, 5, top);
     x86_mov_rm(b, RDX, RDI, 8);             /* k */
     x86_mov_rm(b, RSI, R14, 0);             /* v entry */
-    static const ClosureType prims[] = { CLOS_S, CLOS_K, CLOS_I };
-    static const ClosureType paps[]  = { CLOS_S1, CLOS_K1, CLOS_S2 };
-    u32 pp[3], pq[3];
-    emit_dispatch(b, prims, 3, pp);
-    emit_dispatch(b, paps, 3, pq);
+    static const ClosureType prims[] = { CLOS_S, CLOS_K, CLOS_I, CLOS_B, CLOS_C, CLOS_T, CLOS_R, CLOS_WORD, CLOS_PRIM };
+    static const ClosureType paps[]  = { CLOS_S1, CLOS_K1, CLOS_S2, CLOS_B1, CLOS_B2, CLOS_C1, CLOS_C2, CLOS_T1, CLOS_R1, CLOS_R2, CLOS_PRIM1 };
+    u32 pp[9], pq[11];
+    emit_dispatch(b, prims, 9, pp);
+    emit_dispatch(b, paps, 11, pq);
     x86_int3(b);
     /* primitive: already normal */
-    for (int i = 0; i < 3; i++) x86_patch_rel32(b, pp[i], x86_len(b));
+    for (int i = 0; i < 9; i++) x86_patch_rel32(b, pp[i], x86_len(b));
     x86_mov_rr(b, RBX, RDX);
     emit_call_cont(b);
     /* partial application: eval(v.x, Norm[Field1[v, k]]) */
-    for (int i = 0; i < 3; i++) x86_patch_rel32(b, pq[i], x86_len(b));
+    for (int i = 0; i < 11; i++) x86_patch_rel32(b, pq[i], x86_len(b));
     emit_bump(b, 3);
     emit_get_entry(b, RSI, CLOS_FIELD1);
     x86_mov_mr(b, RAX, 0, RSI);
@@ -446,7 +769,7 @@ static void emit_entry_Norm(NativeEmit *e) {
     emit_enter(b);
 }
 
-/* Field1[v, k]: receives nf(v.x); stores it; S2 continues with y, others finish */
+/* Field1[v, k]: receives nf(v.x); stores it; a two-argument PAP continues with y, the others finish */
 static void emit_entry_Field1(NativeEmit *e) {
     X86Buf *b = &e->code;
     u32 top = x86_len(b);
@@ -456,15 +779,15 @@ static void emit_entry_Field1(NativeEmit *e) {
     x86_mov_rm(b, RDX, RDI, 16);            /* k */
     x86_mov_mr(b, RCX, 8, R14);             /* v.x := nf(v.x) */
     x86_mov_rm(b, RSI, RCX, 0);
-    emit_get_entry(b, R8, CLOS_S2);
-    x86_cmp_rr(b, RSI, R8);
-    u32 is_s2 = emit_jcc(b, CC_E);
-    /* S1 / K1: done -> k(v) */
+    static const ClosureType two[] = { CLOS_S2, CLOS_B2, CLOS_C2, CLOS_R2 };
+    u32 is2[4];
+    emit_dispatch(b, two, 4, is2);
+    /* one captured argument: done -> k(v) */
     x86_mov_rr(b, R14, RCX);
     x86_mov_rr(b, RBX, RDX);
     emit_call_cont(b);
-    /* S2: eval(v.y, Norm[Field2[v, k]]) */
-    x86_patch_rel32(b, is_s2, x86_len(b));
+    /* two: eval(v.y, Norm[Field2[v, k]]) */
+    for (int i = 0; i < 4; i++) x86_patch_rel32(b, is2[i], x86_len(b));
     emit_bump(b, 3);
     emit_get_entry(b, RSI, CLOS_FIELD2);
     x86_mov_mr(b, RAX, 0, RSI);
@@ -1180,62 +1503,6 @@ static void emit_start(NativeEmit *e) {
  * ======================================================================== */
 
 /*
- * Helper: emit a bit to output buffer
- * Clobbers rax, rcx
- * bit value in lowest bit of rdi
- */
-static void emit_output_bit(X86Buf *b) {
-    /* 
-     * Output buffer stores ASCII '0'/'1' characters.
-     * DATA_OUTBUF = buffer base, DATA_OUTPOS = current write position
-     *
-     * buf[pos] = '0' + (rdi & 1)
-     * pos++
-     * if pos >= OUTLEN, flush
-     */
-    
-    /* rax = outbuf base */
-    emit_load_data(b, RAX, DATA_OUTBUF);
-    /* rcx = outpos */
-    emit_load_data(b, RCX, DATA_OUTPOS);
-    
-    /* Calculate character: '0' + (rdi & 1) */
-    x86_mov_rr(b, RDX, RDI);
-    x86_byte(b, 0x48); x86_byte(b, 0x83); x86_byte(b, 0xE2); x86_byte(b, 0x01);  /* and rdx, 1 */
-    x86_add_ri(b, RDX, '0');
-    
-    /* Store byte: [rax + rcx] = dl */
-    x86_byte(b, 0x88); x86_byte(b, 0x14); x86_byte(b, 0x08);  /* mov [rax+rcx], dl */
-    
-    /* Increment position */
-    x86_add_ri(b, RCX, 1);
-    emit_store_data(b, DATA_OUTPOS, RCX);
-    
-    /* Check if flush needed (pos >= outlen) */
-    emit_load_data(b, RDX, DATA_OUTLEN);
-    x86_cmp_rr(b, RCX, RDX);
-    /* jb skip_flush */
-    u32 skip_flush = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x82); x86_dword(b, 0);
-    
-    /* Flush: write(1, buf, pos) */
-    x86_push(b, R14);  /* save r14 */
-    x86_mov_ri(b, RAX, SYS_write);
-    x86_mov_ri(b, RDI, 1);  /* fd = stdout */
-    emit_load_data(b, RSI, DATA_OUTBUF);
-    emit_load_data(b, RDX, DATA_OUTPOS);
-    emit_syscall(b);
-    x86_pop(b, R14);
-    
-    /* Reset position to 0 */
-    x86_mov_ri(b, RCX, 0);
-    emit_store_data(b, DATA_OUTPOS, RCX);
-    
-    /* skip_flush: */
-    x86_patch_rel32(b, skip_flush, x86_len(b));
-}
-
-/*
  * Helper: output a single bit with XOR against DATA_OUTPUT_XOR
  * Input: rdi = bit value (0 or 1)
  * Used for Jot/Jomplement: XOR mask is 0 for Jot, 1 for Jomplement
@@ -1330,244 +1597,85 @@ static void emit_follow_ind(X86Buf *b) {
 }
 
 /*
- * BCL Output Routine
+ * OUTPUT ROUTINE, generic over the format.
  *
- * BCL encoding: K=00, S=01, App(f,x)=1 + encode(f) + encode(x)
- *
- * We use an iterative approach with a stack:
- * - Push closures to process
- * - Pop, emit bits based on type, push children if App
+ * Walks the result with an explicit stack: a leaf writes its bits, a
+ * partial application writes the application bit(s) and pushes its
+ * arguments and its head singleton (so the head prints as a leaf), an
+ * App pushes its two fields. Leaf bit strings are computed here at
+ * emission time (BCL/Jot expand B C T R into their S K trees, XBCL has
+ * codes for them; Jomplement is Jot under the output XOR mask). Words and
+ * primitives print in XBCL only: a pure format stops with a message.
  */
-static void emit_output_bcl(NativeEmit *e) {
-    X86Buf *b = &e->code;
-    e->output_offset = x86_len(b);
-    
-    /*
-     * r14 = root closure to serialize
-     * Use r8 as stack pointer (grows down from heap limit area)
-     * r9 = stack base (for underflow check)
-     */
-    
-    /* Allocate output buffer (4KB) via mmap */
-    x86_mov_ri(b, RAX, SYS_mmap);
-    x86_mov_ri(b, RDI, 0);
-    x86_mov_ri(b, RSI, 4096);
-    x86_mov_ri(b, RDX, MMAP_PROT_RW);
-    x86_mov_ri(b, R10, MMAP_PRIVATE_ANON);
-    x86_mov_ri(b, R8, (u64)-1);
-    x86_mov_ri(b, R9, 0);
-    emit_syscall(b);
-    emit_store_data(b, DATA_OUTBUF, RAX);
-    x86_mov_ri(b, RCX, 0);
-    emit_store_data(b, DATA_OUTPOS, RCX);
-    x86_mov_ri(b, RCX, 4096);
-    emit_store_data(b, DATA_OUTLEN, RCX);
-    
-    /* Allocate traversal stack (64KB) */
-    x86_mov_ri(b, RAX, SYS_mmap);
-    x86_mov_ri(b, RDI, 0);
-    x86_mov_ri(b, RSI, 65536);
-    x86_mov_ri(b, RDX, MMAP_PROT_RW);
-    x86_mov_ri(b, R10, MMAP_PRIVATE_ANON);
-    x86_mov_ri(b, R8, (u64)-1);
-    x86_mov_ri(b, R9, 0);
-    emit_syscall(b);
-    
-    /* r8 = stack top (starts at end, grows down) */
-    x86_mov_rr(b, R8, RAX);
-    x86_add_ri(b, R8, 65536);
-    /* r9 = stack base */
-    x86_mov_rr(b, R9, RAX);
-    
-    /* Push root onto stack */
-    x86_sub_ri(b, R8, 8);
-    x86_mov_mr(b, R8, 0, R14);
-    
-    /* Main loop: while stack not empty */
-    u32 loop_start = x86_len(b);
-    
-    /* Check stack empty (r8 >= r9 + 65536) */
-    x86_mov_rr(b, RAX, R9);
-    x86_add_ri(b, RAX, 65536);
-    x86_cmp_rr(b, R8, RAX);
-    u32 loop_done_patch = x86_len(b) + 2;
-    x86_jae_rel(b, 0);  /* stack empty -> done */
-    
-    /* Pop closure into rcx, save to r10 for field access after emit_output_bit */
-    x86_mov_rm(b, RCX, R8, 0);
-    x86_add_ri(b, R8, 8);
-    x86_mov_rr(b, R10, RCX);  /* r10 = closure (preserved across emit_output_bit) */
-    
-    /* Get entry pointer to determine type */
-    x86_mov_rm(b, RDX, RCX, 0);  /* rdx = entry ptr */
-    emit_follow_ind(b);
-    
-    /* Check for S */
-    emit_get_entry(b, RAX, CLOS_S);
-    x86_cmp_rr(b, RDX, RAX);
-    u32 is_s_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    /* Check for K */
-    emit_get_entry(b, RAX, CLOS_K);
-    x86_cmp_rr(b, RDX, RAX);
-    u32 is_k_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    /* Check for I - emit as SKK */
-    emit_get_entry(b, RAX, CLOS_I);
-    x86_cmp_rr(b, RDX, RAX);
-    u32 is_i_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    /* Check for S1[x] - emit as App(S, x) */
-    emit_get_entry(b, RAX, CLOS_S1);
-    x86_cmp_rr(b, RDX, RAX);
-    u32 is_s1_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    /* Check for S2[x,y] - emit as App(App(S, x), y) */
-    emit_get_entry(b, RAX, CLOS_S2);
-    x86_cmp_rr(b, RDX, RAX);
-    u32 is_s2_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    /* Check for K1[x] - emit as App(K, x) */
-    emit_get_entry(b, RAX, CLOS_K1);
-    x86_cmp_rr(b, RDX, RAX);
-    u32 is_k1_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    /* Check for App[f,x] */
-    emit_get_entry(b, RAX, CLOS_APP);
-    x86_cmp_rr(b, RDX, RAX);
-    u32 is_app_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    /* Unknown type - trap */
-    x86_int3(b);
-    
-    /* is_s: emit 01 */
-    u32 is_s_target = x86_len(b);
-    x86_patch_rel32(b, is_s_patch, is_s_target);
-    x86_mov_ri(b, RDI, 0);
-    emit_output_bit(b);
-    x86_mov_ri(b, RDI, 1);
-    emit_output_bit(b);
-    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
-    
-    /* is_k: emit 00 */
-    u32 is_k_target = x86_len(b);
-    x86_patch_rel32(b, is_k_patch, is_k_target);
-    x86_mov_ri(b, RDI, 0);
-    emit_output_bit(b);
-    x86_mov_ri(b, RDI, 0);
-    emit_output_bit(b);
-    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
-    
-    /* is_i: I = S K K, so emit 1 1 01 00 00 (App(App(S,K),K)) */
-    u32 is_i_target = x86_len(b);
-    x86_patch_rel32(b, is_i_patch, is_i_target);
-    /* 1 (outer app) */
-    x86_mov_ri(b, RDI, 1); emit_output_bit(b);
-    /* 1 (inner app) */
-    x86_mov_ri(b, RDI, 1); emit_output_bit(b);
-    /* 01 (S) */
-    x86_mov_ri(b, RDI, 0); emit_output_bit(b);
-    x86_mov_ri(b, RDI, 1); emit_output_bit(b);
-    /* 00 (K) */
-    x86_mov_ri(b, RDI, 0); emit_output_bit(b);
-    x86_mov_ri(b, RDI, 0); emit_output_bit(b);
-    /* 00 (K) */
-    x86_mov_ri(b, RDI, 0); emit_output_bit(b);
-    x86_mov_ri(b, RDI, 0); emit_output_bit(b);
-    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
-    
-    /* is_s1: S1[x] = App(S, x), emit 1, push x, push S-singleton */
-    u32 is_s1_target = x86_len(b);
-    x86_patch_rel32(b, is_s1_patch, is_s1_target);
-    x86_mov_ri(b, RDI, 1); emit_output_bit(b);
-    /* Push x = [r10+8] (r10 preserved across emit_output_bit) */
-    x86_mov_rm(b, RAX, R10, 8);
-    x86_sub_ri(b, R8, 8);
-    x86_mov_mr(b, R8, 0, RAX);
-    /* Push S singleton address */
-    x86_lea(b, RAX, R15, DATA_PRIM_S);
-    x86_sub_ri(b, R8, 8);
-    x86_mov_mr(b, R8, 0, RAX);
-    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
-    
-    /* is_s2: S2[x,y] = App(App(S,x), y), emit 1, push y, push App(S,x) as S1[x] */
-    u32 is_s2_target = x86_len(b);
-    x86_patch_rel32(b, is_s2_patch, is_s2_target);
-    x86_mov_ri(b, RDI, 1); emit_output_bit(b);
-    /* Push y = [r10+16] (r10 preserved across emit_output_bit) */
-    x86_mov_rm(b, RAX, R10, 16);
-    x86_sub_ri(b, R8, 8);
-    x86_mov_mr(b, R8, 0, RAX);
-    /* For App(S,x), we need to emit 1 + S + x */
-    /* Push x */
-    x86_mov_rm(b, RAX, R10, 8);
-    x86_sub_ri(b, R8, 8);
-    x86_mov_mr(b, R8, 0, RAX);
-    /* Push marker for "emit 1 then S" - use S singleton, handle specially */
-    /* Actually simpler: just emit 1, S inline, then push x */
-    /* Let me redo: emit 1 1, push x, push S, push y - wait that's wrong order */
-    /* Need: 1 (outer) then 1 (inner) then 01 (S) then encode(x) then encode(y) */
-    /* So emit: 1, then push y (to do last), then handle App(S,x) */
-    /* Actually let's just emit the bits inline for the S part */
-    x86_mov_ri(b, RDI, 1); emit_output_bit(b);  /* inner app bit */
-    x86_mov_ri(b, RDI, 0); emit_output_bit(b);  /* S = 01 */
-    x86_mov_ri(b, RDI, 1); emit_output_bit(b);
-    /* Now stack has [y, x], which is correct order for BCL (x first, then y) */
-    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
-    
-    /* is_k1: K1[x] = App(K, x), emit 1, push x, push K-singleton */
-    u32 is_k1_target = x86_len(b);
-    x86_patch_rel32(b, is_k1_patch, is_k1_target);
-    x86_mov_ri(b, RDI, 1); emit_output_bit(b);
-    x86_mov_rm(b, RAX, R10, 8);  /* r10 preserved across emit_output_bit */
-    x86_sub_ri(b, R8, 8);
-    x86_mov_mr(b, R8, 0, RAX);
-    x86_lea(b, RAX, R15, DATA_PRIM_K);
-    x86_sub_ri(b, R8, 8);
-    x86_mov_mr(b, R8, 0, RAX);
-    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
-    
-    /* is_app: App[f,x], emit 1, push x, push f */
-    u32 is_app_target = x86_len(b);
-    x86_patch_rel32(b, is_app_patch, is_app_target);
-    x86_mov_ri(b, RDI, 1); emit_output_bit(b);
-    /* Push x = [r10+16] first (will be popped second) - r10 preserved */
-    x86_mov_rm(b, RAX, R10, 16);
-    x86_sub_ri(b, R8, 8);
-    x86_mov_mr(b, R8, 0, RAX);
-    /* Push f = [r10+8] (will be popped first) */
-    x86_mov_rm(b, RAX, R10, 8);
-    x86_sub_ri(b, R8, 8);
-    x86_mov_mr(b, R8, 0, RAX);
-    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
-    
-    /* loop_done: flush and exit */
-    u32 loop_done_target = x86_len(b);
-    x86_patch_rel32(b, loop_done_patch, loop_done_target);
-    emit_flush_and_exit(b);
+static u64 qword_of(const char *s) {
+    u64 w = 0;
+    for (int i = 0; i < 8; i++) w |= (u64)(u8)s[i] << (8 * i);
+    return w;
 }
 
-/*
- * Jot/Jomplement Output Routine
- * 
- * Jot encoding (verified from esolangs):
- *   K = 11100 (5 bits)
- *   S = 11111000 (8 bits)
- *   I = SKK = 1 + 1 + 11111000 + 11100 + 11100 = 20 bits
- *   App(a,b) = 1 + encode(a) + encode(b)
- *
- * Same traversal structure as BCL, just different bit patterns.
- * Uses DATA_OUTPUT_XOR: 0 for Jot, 1 for Jomplement (all bits inverted).
- */
-static void emit_output_jot_impl(NativeEmit *e) {
+static void leaf_bits(OutputFormat fmt, SKITag tag, char *out) {
+    if (fmt == OUTPUT_XBCL) {
+        const char *x = NULL;
+        switch (tag) {
+        case TERM_S: x = "010"; break;
+        case TERM_K: x = "00"; break;
+        case TERM_I: x = "01100000"; break;
+        case TERM_B: x = "01100001"; break;
+        case TERM_C: x = "01100010"; break;
+        case TERM_T: x = "01100011"; break;
+        case TERM_R: x = "01100100"; break;
+        default: x = ""; break;
+        }
+        strcpy(out, x);
+        return;
+    }
+    out[0] = 0;
+    const char *e = ski_expansion(tag);
+    for (; e && *e; e++) {
+        char sub[256];
+        switch (*e) {
+        case '1': strcat(out, "1"); break;
+        case 'S': strcat(out, fmt == OUTPUT_BCL ? "01" : "11111000"); break;
+        case 'K': strcat(out, fmt == OUTPUT_BCL ? "00" : "11100"); break;
+        case 'I': leaf_bits(fmt, TERM_I, sub); strcat(out, sub); break;
+        case 'B': leaf_bits(fmt, TERM_B, sub); strcat(out, sub); break;
+        case 'C': leaf_bits(fmt, TERM_C, sub); strcat(out, sub); break;
+        default: break;
+        }
+    }
+}
+
+static void emit_bits(X86Buf *b, const char *bits) {
+    for (; *bits; bits++) {
+        x86_mov_ri(b, RDI, *bits == '1' ? 1 : 0);
+        emit_output_bit_xor(b);
+    }
+}
+
+/* push a register on the traversal stack (r8) */
+static void emit_tpush(X86Buf *b, X86Reg r) {
+    x86_sub_ri(b, R8, 8);
+    x86_mov_mr(b, R8, 0, r);
+}
+
+/* Write the top `count` bits of RBX, most significant first. Clobbers RAX, RCX, RDX, RDI, R13. */
+static void emit_top_bits(X86Buf *b, int count) {
+    x86_mov_ri(b, R13, count);
+    u32 top = x86_len(b);
+    x86_mov_rr(b, RDI, RBX);
+    emit_shr_ri(b, RDI, 63);
+    emit_output_bit_xor(b);
+    emit_shl_ri(b, RBX, 1);
+    x86_sub_ri(b, R13, 1);
+    x86_cmp_ri(b, R13, 0);
+    u32 done = emit_jcc(b, CC_E);
+    emit_jmp_back(b, top);
+    x86_patch_rel32(b, done, x86_len(b));
+}
+
+static void emit_output_terms(NativeEmit *e) {
     X86Buf *b = &e->code;
+    OutputFormat fmt = e->output_fmt;
     e->output_offset = x86_len(b);
     
     /* Allocate output buffer (4KB) via mmap */
@@ -1595,233 +1703,120 @@ static void emit_output_jot_impl(NativeEmit *e) {
     x86_mov_ri(b, R9, 0);
     emit_syscall(b);
     
-    /* r8 = stack top (starts at end, grows down) */
+    /* r8 = stack top (starts at end, grows down), r9 = stack base */
     x86_mov_rr(b, R8, RAX);
     x86_add_ri(b, R8, 65536);
-    /* r9 = stack base */
     x86_mov_rr(b, R9, RAX);
     
     /* Push root onto stack */
-    x86_sub_ri(b, R8, 8);
-    x86_mov_mr(b, R8, 0, R14);
+    emit_tpush(b, R14);
     
     /* Main loop: while stack not empty */
     u32 loop_start = x86_len(b);
-    
-    /* Check stack empty (r8 >= r9 + 65536) */
     x86_mov_rr(b, RAX, R9);
     x86_add_ri(b, RAX, 65536);
     x86_cmp_rr(b, R8, RAX);
     u32 loop_done_patch = x86_len(b) + 2;
     x86_jae_rel(b, 0);  /* stack empty -> done */
     
-    /* Pop closure into rcx, save to r10 */
+    /* Pop closure into rcx, save to r10 (preserved across the bit writer) */
     x86_mov_rm(b, RCX, R8, 0);
     x86_add_ri(b, R8, 8);
     x86_mov_rr(b, R10, RCX);
-    
-    /* Get entry pointer to determine type */
-    x86_mov_rm(b, RDX, RCX, 0);
+    x86_mov_rm(b, RDX, RCX, 0);  /* rdx = entry ptr */
     emit_follow_ind(b);
     
-    /* Check for S */
-    emit_get_entry(b, RAX, CLOS_S);
-    x86_cmp_rr(b, RDX, RAX);
-    u32 is_s_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
+    static const ClosureType leaves[] = { CLOS_S, CLOS_K, CLOS_I, CLOS_B, CLOS_C, CLOS_T, CLOS_R };
+    static const SKITag leaf_tags[]   = { TERM_S, TERM_K, TERM_I, TERM_B, TERM_C, TERM_T, TERM_R };
+    static const ClosureType one[]    = { CLOS_S1, CLOS_K1, CLOS_B1, CLOS_C1, CLOS_T1, CLOS_R1, CLOS_PRIM1 };
+    static const int one_head[]       = { DATA_PRIM_S, DATA_PRIM_K, DATA_PRIM_B, DATA_PRIM_C, DATA_PRIM_T, DATA_PRIM_R, -1 };
+    static const ClosureType two[]    = { CLOS_S2, CLOS_B2, CLOS_C2, CLOS_R2 };
+    static const int two_head[]       = { DATA_PRIM_S, DATA_PRIM_B, DATA_PRIM_C, DATA_PRIM_R };
+    u32 pl[7], p1[7], p2[4], pw, pp, pa;
+    for (int i = 0; i < 7; i++) { emit_get_entry(b, RAX, leaves[i]); x86_cmp_rr(b, RDX, RAX); pl[i] = emit_jcc(b, CC_E); }
+    for (int i = 0; i < 7; i++) { emit_get_entry(b, RAX, one[i]);    x86_cmp_rr(b, RDX, RAX); p1[i] = emit_jcc(b, CC_E); }
+    for (int i = 0; i < 4; i++) { emit_get_entry(b, RAX, two[i]);    x86_cmp_rr(b, RDX, RAX); p2[i] = emit_jcc(b, CC_E); }
+    emit_get_entry(b, RAX, CLOS_WORD); x86_cmp_rr(b, RDX, RAX); pw = emit_jcc(b, CC_E);
+    emit_get_entry(b, RAX, CLOS_PRIM); x86_cmp_rr(b, RDX, RAX); pp = emit_jcc(b, CC_E);
+    emit_get_entry(b, RAX, CLOS_APP);  x86_cmp_rr(b, RDX, RAX); pa = emit_jcc(b, CC_E);
+    x86_int3(b);   /* not a normal form */
     
-    /* Check for K */
-    emit_get_entry(b, RAX, CLOS_K);
-    x86_cmp_rr(b, RDX, RAX);
-    u32 is_k_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    /* Check for I */
-    emit_get_entry(b, RAX, CLOS_I);
-    x86_cmp_rr(b, RDX, RAX);
-    u32 is_i_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    /* Check for S1[x] */
-    emit_get_entry(b, RAX, CLOS_S1);
-    x86_cmp_rr(b, RDX, RAX);
-    u32 is_s1_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    /* Check for S2[x,y] */
-    emit_get_entry(b, RAX, CLOS_S2);
-    x86_cmp_rr(b, RDX, RAX);
-    u32 is_s2_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    /* Check for K1[x] */
-    emit_get_entry(b, RAX, CLOS_K1);
-    x86_cmp_rr(b, RDX, RAX);
-    u32 is_k1_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    /* Check for App[f,x] */
-    emit_get_entry(b, RAX, CLOS_APP);
-    x86_cmp_rr(b, RDX, RAX);
-    u32 is_app_patch = x86_len(b) + 2;
-    x86_byte(b, 0x0F); x86_byte(b, 0x84); x86_dword(b, 0);
-    
-    /* Unknown type - trap */
-    x86_int3(b);
-    
-    /* is_s: emit 11111000 */
-    u32 is_s_target = x86_len(b);
-    x86_patch_rel32(b, is_s_patch, is_s_target);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
-    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
-    
-    /* is_k: emit 11100 */
-    u32 is_k_target = x86_len(b);
-    x86_patch_rel32(b, is_k_patch, is_k_target);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
-    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
-    
-    /* is_i: I = SKK = 1 + 1 + S + K + K = 1 + 1 + 11111000 + 11100 + 11100 */
-    u32 is_i_target = x86_len(b);
-    x86_patch_rel32(b, is_i_patch, is_i_target);
-    /* 1 (outer app) */
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    /* 1 (inner app) */
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    /* S = 11111000 */
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
-    /* K = 11100 */
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
-    /* K = 11100 */
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
-    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
-    
-    /* is_s1: S1[x] = App(S, x), emit 1, push x, push S-singleton */
-    u32 is_s1_target = x86_len(b);
-    x86_patch_rel32(b, is_s1_patch, is_s1_target);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    /* Push x = [r10+8] */
-    x86_mov_rm(b, RAX, R10, 8);
-    x86_sub_ri(b, R8, 8);
-    x86_mov_mr(b, R8, 0, RAX);
-    /* Push S singleton */
-    x86_lea(b, RAX, R15, DATA_PRIM_S);
-    x86_sub_ri(b, R8, 8);
-    x86_mov_mr(b, R8, 0, RAX);
-    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
-    
-    /* is_s2: S2[x,y] = App(App(S,x), y), emit 1, push y, then emit 1, S inline, push x */
-    u32 is_s2_target = x86_len(b);
-    x86_patch_rel32(b, is_s2_patch, is_s2_target);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    /* Push y = [r10+16] */
+    /* leaves */
+    for (int i = 0; i < 7; i++) {
+        char bits[256];
+        leaf_bits(fmt, leaf_tags[i], bits);
+        x86_patch_rel32(b, pl[i], x86_len(b));
+        emit_bits(b, bits);
+        emit_jmp_back(b, loop_start);
+    }
+    /* a word: 011 00101 then its 64 bits; a primitive: 011 then its 5-bit code 6 + op */
+    x86_patch_rel32(b, pw, x86_len(b));
+    if (fmt == OUTPUT_XBCL) {
+        emit_bits(b, "01100101");
+        x86_mov_rm(b, RBX, R10, 8);
+        emit_top_bits(b, 64);
+        emit_jmp_back(b, loop_start);
+    } else {
+        emit_die(b, qword_of("words ne"), qword_of("ed xbcl\n"), 1);
+    }
+    x86_patch_rel32(b, pp, x86_len(b));
+    if (fmt == OUTPUT_XBCL) {
+        emit_bits(b, "011");
+        x86_mov_rm(b, RBX, R10, 8);
+        x86_add_ri(b, RBX, 6);
+        emit_shl_ri(b, RBX, 59);
+        emit_top_bits(b, 5);
+        emit_jmp_back(b, loop_start);
+    } else {
+        emit_die(b, qword_of("words ne"), qword_of("ed xbcl\n"), 1);
+    }
+    /* PAP[x] = App(head, x): 1, then head, then x */
+    for (int i = 0; i < 7; i++) {
+        x86_patch_rel32(b, p1[i], x86_len(b));
+        emit_bits(b, "1");
+        x86_mov_rm(b, RAX, R10, 8);
+        emit_tpush(b, RAX);
+        if (one_head[i] >= 0) {
+            x86_lea(b, RAX, R15, one_head[i]);
+        } else {                                    /* Prim1[x, op]: the head is Prim[op] */
+            x86_mov_rm(b, RAX, R10, 16);
+            emit_prim_singleton(b, RAX);
+        }
+        emit_tpush(b, RAX);
+        emit_jmp_back(b, loop_start);
+    }
+    /* PAP[x, y] = App(App(head, x), y): 1, 1, head, x, y */
+    for (int i = 0; i < 4; i++) {
+        x86_patch_rel32(b, p2[i], x86_len(b));
+        emit_bits(b, "1");
+        x86_mov_rm(b, RAX, R10, 16);
+        emit_tpush(b, RAX);
+        emit_bits(b, "1");
+        x86_mov_rm(b, RAX, R10, 8);
+        emit_tpush(b, RAX);
+        x86_lea(b, RAX, R15, two_head[i]);
+        emit_tpush(b, RAX);
+        emit_jmp_back(b, loop_start);
+    }
+    /* App[f, x]: 1, f, x */
+    x86_patch_rel32(b, pa, x86_len(b));
+    emit_bits(b, "1");
     x86_mov_rm(b, RAX, R10, 16);
-    x86_sub_ri(b, R8, 8);
-    x86_mov_mr(b, R8, 0, RAX);
-    /* Push x */
+    emit_tpush(b, RAX);
     x86_mov_rm(b, RAX, R10, 8);
-    x86_sub_ri(b, R8, 8);
-    x86_mov_mr(b, R8, 0, RAX);
-    /* Emit 1 for inner app, then S inline */
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    /* S = 11111000 */
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
-    x86_mov_ri(b, RDI, 0); emit_output_bit_xor(b);
-    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
-    
-    /* is_k1: K1[x] = App(K, x), emit 1, push x, push K-singleton */
-    u32 is_k1_target = x86_len(b);
-    x86_patch_rel32(b, is_k1_patch, is_k1_target);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    x86_mov_rm(b, RAX, R10, 8);
-    x86_sub_ri(b, R8, 8);
-    x86_mov_mr(b, R8, 0, RAX);
-    x86_lea(b, RAX, R15, DATA_PRIM_K);
-    x86_sub_ri(b, R8, 8);
-    x86_mov_mr(b, R8, 0, RAX);
-    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
-    
-    /* is_app: App[f,x], emit 1, push x, push f */
-    u32 is_app_target = x86_len(b);
-    x86_patch_rel32(b, is_app_patch, is_app_target);
-    x86_mov_ri(b, RDI, 1); emit_output_bit_xor(b);
-    /* Push x = [r10+16] first (will be popped second) */
-    x86_mov_rm(b, RAX, R10, 16);
-    x86_sub_ri(b, R8, 8);
-    x86_mov_mr(b, R8, 0, RAX);
-    /* Push f = [r10+8] (will be popped first) */
-    x86_mov_rm(b, RAX, R10, 8);
-    x86_sub_ri(b, R8, 8);
-    x86_mov_mr(b, R8, 0, RAX);
-    x86_jmp_rel(b, loop_start - (x86_len(b) + 5));
+    emit_tpush(b, RAX);
+    emit_jmp_back(b, loop_start);
     
     /* loop_done: flush and exit */
-    u32 loop_done_target = x86_len(b);
-    x86_patch_rel32(b, loop_done_patch, loop_done_target);
+    x86_patch_rel32(b, loop_done_patch, x86_len(b));
     emit_flush_and_exit(b);
-}
-
-/*
- * Jot Output - calls shared impl with XOR=0
- */
-static void emit_output_jot(NativeEmit *e) {
-    emit_output_jot_impl(e);
-}
-
-/*
- * Jomplement Output - calls shared impl with XOR=1 (set at init time)
- */
-static void emit_output_jomplement(NativeEmit *e) {
-    emit_output_jot_impl(e);
 }
 
 /*
  * Emit output routine based on format and patch Halt jump
  */
 static void emit_output(NativeEmit *e) {
-    switch (e->output_fmt) {
-        case OUTPUT_BCL:
-            emit_output_bcl(e);
-            break;
-        case OUTPUT_JOT:
-            emit_output_jot(e);
-            break;
-        case OUTPUT_JOMPLEMENT:
-            emit_output_jomplement(e);
-            break;
-    }
+    emit_output_terms(e);
     
     /* Patch Halt's jump to point to output routine */
     i32 rel = e->output_offset - (e->halt_output_patch + 4);
@@ -1839,6 +1834,11 @@ void native_emit_runtime(NativeEmit *e) {
     emit_entry_S1(e);
     emit_entry_S2(e);
     emit_entry_K1(e);
+    static const ClosureType values[] = {
+        CLOS_B, CLOS_C, CLOS_T, CLOS_R, CLOS_B1, CLOS_B2, CLOS_C1, CLOS_C2, CLOS_T1, CLOS_R1, CLOS_R2,
+        CLOS_WORD, CLOS_PRIM, CLOS_PRIM1
+    };
+    for (int i = 0; i < 14; i++) emit_entry_value(e, values[i]);
     /* Thunks and continuations */
     emit_entry_App(e);
     emit_entry_Ind(e);
@@ -1880,6 +1880,19 @@ u32 native_get_entry(NativeEmit *e) {
  * ======================================================================== */
 
 static u32 calc_term_size(SKITerm *term);
+
+/* The extended singletons in a data section: B C T R and Prim[op] for every op. code_base: where the entry offsets are relative to. */
+static void fill_extended_singletons(u8 *data, u64 code_base, const u32 *entry_offsets) {
+    *(u64*)(data + DATA_PRIM_B) = code_base + entry_offsets[CLOS_B];
+    *(u64*)(data + DATA_PRIM_C) = code_base + entry_offsets[CLOS_C];
+    *(u64*)(data + DATA_PRIM_T) = code_base + entry_offsets[CLOS_T];
+    *(u64*)(data + DATA_PRIM_R) = code_base + entry_offsets[CLOS_R];
+    for (int op = 0; op < PRIM_COUNT; op++) {
+        u64 *pr = (u64*)(data + DATA_PRIM_OPS + 16 * op);
+        pr[0] = code_base + entry_offsets[CLOS_PRIM];
+        pr[1] = (u64)op;
+    }
+}
 
 /*
  * The growth ceiling of one semispace. -H sets the INITIAL size only: a
@@ -1971,6 +1984,7 @@ NativeJIT *native_jit_prepare(NativeEmit *e, u32 heap_size) {
     *prim_k = (u64)jit->code + e->entry_offsets[CLOS_K];
     *prim_i = (u64)jit->code + e->entry_offsets[CLOS_I];
     *halt = (u64)jit->code + e->entry_offsets[CLOS_HALT];
+    fill_extended_singletons((u8*)jit->data, (u64)jit->code, e->entry_offsets);
     
     /* Store start offset for native_jit_run */
     jit->start_offset = e->start_offset;
@@ -2010,6 +2024,24 @@ static u64 build_term_recursive(NativeJIT *jit, SKITerm *term, u8 **hp_ptr) {
             
         case TERM_I:
             return (u64)((u8*)jit->data + DATA_PRIM_I);
+        case TERM_B:
+            return (u64)((u8*)jit->data + DATA_PRIM_B);
+        case TERM_C:
+            return (u64)((u8*)jit->data + DATA_PRIM_C);
+        case TERM_T:
+            return (u64)((u8*)jit->data + DATA_PRIM_T);
+        case TERM_R:
+            return (u64)((u8*)jit->data + DATA_PRIM_R);
+        case TERM_PRIM:
+            return (u64)((u8*)jit->data + DATA_PRIM_OPS + 16 * (u64)term->op);
+        case TERM_WORD: {
+            /* Word[w] - 2 words */
+            u64 *w = (u64*)*hp_ptr;
+            *hp_ptr += 16;
+            w[0] = data[(DATA_ENTRY_TABLE / 8) + CLOS_WORD];
+            w[1] = term->word;
+            return (u64)w;
+        }
             
         case TERM_APP: {
             /* Build children first (depth-first) */
@@ -2028,8 +2060,8 @@ static u64 build_term_recursive(NativeJIT *jit, SKITerm *term, u8 **hp_ptr) {
         }
     }
     
-    /* Fallback - shouldn't happen */
-    return (u64)((u8*)jit->data + DATA_PRIM_I);
+    fprintf(stderr, "native: term tag %d has no closure yet\n", (int)term->tag);
+    abort();
 }
 
 /*
@@ -2309,10 +2341,19 @@ static u32 calc_term_size(SKITerm *term) {
         case TERM_K:
         case TERM_I:
             return 0;  /* singletons, no heap allocation */
+        case TERM_B:
+        case TERM_C:
+        case TERM_T:
+        case TERM_R:
+        case TERM_PRIM:
+            return 0;  /* singletons in the data section */
+        case TERM_WORD:
+            return 16;
         case TERM_APP:
             return 24 + calc_term_size(term->app.left) + calc_term_size(term->app.right);
     }
-    return 0;
+    fprintf(stderr, "native: term tag %d has no closure\n", (int)term->tag);
+    abort();
 }
 
 /*
@@ -2341,6 +2382,24 @@ static u64 build_term_for_elf(SKITerm *term, u8 *buf, u64 buf_vaddr, u32 *hp,
             return data_vaddr + DATA_PRIM_K;
         case TERM_I:
             return data_vaddr + DATA_PRIM_I;
+        case TERM_B:
+            return data_vaddr + DATA_PRIM_B;
+        case TERM_C:
+            return data_vaddr + DATA_PRIM_C;
+        case TERM_T:
+            return data_vaddr + DATA_PRIM_T;
+        case TERM_R:
+            return data_vaddr + DATA_PRIM_R;
+        case TERM_PRIM:
+            return data_vaddr + DATA_PRIM_OPS + 16 * (u64)term->op;
+        case TERM_WORD: {
+            u32 offset = *hp;
+            *hp += 16;
+            u64 *w = (u64*)(buf + offset);
+            w[0] = code_vaddr + entry_offsets[CLOS_WORD];
+            w[1] = term->word;
+            return buf_vaddr + offset;
+        }
         case TERM_APP: {
             /* Build children first */
             u64 f_vaddr = build_term_for_elf(term->app.left, buf, buf_vaddr, hp,
@@ -2360,7 +2419,8 @@ static u64 build_term_for_elf(SKITerm *term, u8 *buf, u64 buf_vaddr, u32 *hp,
             return buf_vaddr + offset;
         }
     }
-    return data_vaddr + DATA_PRIM_I;  /* fallback */
+    fprintf(stderr, "native: term tag %d has no closure\n", (int)term->tag);
+    abort();
 }
 
 /*
@@ -2443,6 +2503,7 @@ void native_emit_elf(NativeEmit *e, u8 **out, u32 *out_size, SKITerm *term, u32 
     *prim_k = code_vaddr + e->entry_offsets[CLOS_K];
     *prim_i = code_vaddr + e->entry_offsets[CLOS_I];
     *halt = code_vaddr + e->entry_offsets[CLOS_HALT];
+    fill_extended_singletons(data, code_vaddr, e->entry_offsets);
     
     /* Build initial term in data section after fixed fields */
     u64 term_buf_vaddr = data_vaddr + DATA_SECTION_SIZE;

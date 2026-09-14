@@ -64,24 +64,51 @@ static bool jot_buf_write_str(JotBuffer *buf, const char *pattern) {
     return true;
 }
 
+/* A leaf's pure S K spelling (ski_expansion) in Jot: '1' application, S = 11111000, K = 11100, other letters expand in turn */
+static u64 jot_expansion_size(const char *e) {
+    u64 n = 0;
+    for (; *e; e++) {
+        switch (*e) {
+            case '1': n += 1; break;
+            case 'S': n += 8; break;
+            case 'K': n += 5; break;
+            case 'I': n += jot_expansion_size(ski_expansion(TERM_I)); break;
+            case 'B': n += jot_expansion_size(ski_expansion(TERM_B)); break;
+            case 'C': n += jot_expansion_size(ski_expansion(TERM_C)); break;
+            default: break;
+        }
+    }
+    return n;
+}
+
+static bool jot_emit_expansion(JotBuffer *buf, const char *e) {
+    for (; *e; e++) {
+        switch (*e) {
+            case '1': if (!jot_buf_write(buf, 1)) return false; break;
+            case 'S': if (!jot_buf_write_str(buf, "11111000")) return false; break;
+            case 'K': if (!jot_buf_write_str(buf, "11100")) return false; break;
+            case 'I': if (!jot_emit_expansion(buf, ski_expansion(TERM_I))) return false; break;
+            case 'B': if (!jot_emit_expansion(buf, ski_expansion(TERM_B))) return false; break;
+            case 'C': if (!jot_emit_expansion(buf, ski_expansion(TERM_C))) return false; break;
+            default: return false;
+        }
+    }
+    return true;
+}
+
 /* Calculate size in bits for SKI → Jot encoding */
 static u64 ski_jot_size(SKITerm *t) {
     if (!t) return 0;
     
     switch (t->tag) {
-        case TERM_K:
-            return 5;   /* "11100" */
-        case TERM_S:
-            return 8;   /* "11111000" */
-        case TERM_I:
-            /* I = SKK = 1{S}1{K}{K} = 1 + 8 + 1 + 5 + 5 = 20 bits */
-            /* Or use 1{1{S}{K}}{K} = 1 + (1+8+5) + 5 = 20 bits */
-            return 20;
         case TERM_APP:
             /* {AB} = 1{A}{B} */
             return 1 + ski_jot_size(t->app.left) + ski_jot_size(t->app.right);
-        default:
+        case TERM_WORD:
+        case TERM_PRIM:
             return 0;
+        default:
+            return jot_expansion_size(ski_expansion(t->tag));
     }
 }
 
@@ -90,26 +117,17 @@ static bool emit_ski_to_jot(SKITerm *t, JotBuffer *buf) {
     if (!t) return false;
     
     switch (t->tag) {
-        case TERM_K:
-            return jot_buf_write_str(buf, "11100");
-        case TERM_S:
-            return jot_buf_write_str(buf, "11111000");
-        case TERM_I:
-            /* I = ((S K) K) = 1{1{S}{K}}{K} */
-            /* = 1 + 1 + 11111000 + 11100 + 11100 */
-            return jot_buf_write(buf, 1) &&
-                   jot_buf_write(buf, 1) &&
-                   jot_buf_write_str(buf, "11111000") &&
-                   jot_buf_write_str(buf, "11100") &&
-                   jot_buf_write_str(buf, "11100");
         case TERM_APP:
             /* {AB} = 1{A}{B} */
             if (!jot_buf_write(buf, 1)) return false;
             if (!emit_ski_to_jot(t->app.left, buf)) return false;
             if (!emit_ski_to_jot(t->app.right, buf)) return false;
             return true;
+        case TERM_WORD:
+        case TERM_PRIM:
+            return false;   /* no pure spelling */
         default:
-            return false;
+            return jot_emit_expansion(buf, ski_expansion(t->tag));
     }
 }
 

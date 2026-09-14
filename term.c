@@ -90,6 +90,116 @@ SKITerm *ski_app(SKIPool *p, SKITerm *left, SKITerm *right) {
     return t;
 }
 
+static SKITerm *leaf(SKIPool *p, SKITag tag) {
+    SKITerm *t = pool_alloc(p);
+    if (!t) return NULL;
+    t->tag = tag;
+    t->refs = 1;
+    return t;
+}
+SKITerm *ski_b(SKIPool *p) { return leaf(p, TERM_B); }
+SKITerm *ski_c(SKIPool *p) { return leaf(p, TERM_C); }
+SKITerm *ski_t(SKIPool *p) { return leaf(p, TERM_T); }
+SKITerm *ski_r(SKIPool *p) { return leaf(p, TERM_R); }
+SKITerm *ski_word(SKIPool *p, u64 w) { SKITerm *t = leaf(p, TERM_WORD); if (t) t->word = w; return t; }
+SKITerm *ski_prim(SKIPool *p, PrimOp op) { SKITerm *t = leaf(p, TERM_PRIM); if (t) t->op = op; return t; }
+
+int ski_arity(SKITag tag) {
+    switch (tag) {
+    case TERM_S: case TERM_B: case TERM_C: case TERM_R: return 3;
+    case TERM_K: case TERM_T: case TERM_PRIM: return 2;
+    case TERM_I: case TERM_WORD: return 1;
+    default: return 0;
+    }
+}
+
+const char *prim_name(PrimOp op) {
+    static const char *names[PRIM_COUNT] = {
+        "add", "sub", "mul", "and", "or", "xor", "shl", "shr",
+        "eq", "lt", "addc", "subb", "mull", "divmod"
+    };
+    return op < PRIM_COUNT ? names[op] : "?";
+}
+
+const char *ski_expansion(SKITag tag) {
+    switch (tag) {
+    case TERM_S: return "S";
+    case TERM_K: return "K";
+    case TERM_I: return "11SKK";             /* S K K */
+    case TERM_B: return "11S1KSK";           /* S (K S) K */
+    case TERM_C: return "11S11S1KBS1KK";     /* S (S (K B) S) (K K) */
+    case TERM_T: return "1CI";               /* C I */
+    case TERM_R: return "1CC";               /* C C */
+    default: return NULL;
+    }
+}
+
+/* A leaf's expansion string (ski_expansion) as a term */
+static SKITerm *expansion_term(SKIPool *p, const char **e) {
+    char c = *(*e)++;
+    switch (c) {
+    case 'S': return ski_s(p);
+    case 'K': return ski_k(p);
+    case 'I': { const char *x = ski_expansion(TERM_I); return expansion_term(p, &x); }
+    case 'B': { const char *x = ski_expansion(TERM_B); return expansion_term(p, &x); }
+    case 'C': { const char *x = ski_expansion(TERM_C); return expansion_term(p, &x); }
+    case '1': {
+        SKITerm *l = expansion_term(p, e);
+        if (!l) return NULL;
+        SKITerm *r = expansion_term(p, e);
+        if (!r) { ski_unref(p, l); return NULL; }
+        SKITerm *a = ski_app(p, l, r);
+        if (!a) { ski_unref(p, l); ski_unref(p, r); }
+        return a;
+    }
+    default: return NULL;
+    }
+}
+
+typedef struct { SKITerm *leaf[4]; } PureLeaves;   /* B C T R, built once each */
+
+static SKITerm *expand_pure(SKIPool *p, SKITerm *t, PureLeaves *pl) {
+    switch (t->tag) {
+    case TERM_S: return ski_s(p);
+    case TERM_K: return ski_k(p);
+    case TERM_I: return ski_i(p);
+    case TERM_B: case TERM_C: case TERM_T: case TERM_R: {
+        int i = t->tag - TERM_B;
+        if (!pl->leaf[i]) { const char *x = ski_expansion(t->tag); pl->leaf[i] = expansion_term(p, &x); }
+        return ski_ref(pl->leaf[i]);
+    }
+    case TERM_APP: {
+        SKITerm *l = expand_pure(p, t->app.left, pl);
+        if (!l) return NULL;
+        SKITerm *r = expand_pure(p, t->app.right, pl);
+        if (!r) { ski_unref(p, l); return NULL; }
+        SKITerm *a = ski_app(p, l, r);
+        if (!a) { ski_unref(p, l); ski_unref(p, r); }
+        return a;
+    }
+    default: return NULL;   /* words and primitives */
+    }
+}
+
+SKITerm *ski_expand_pure(SKIPool *p, SKITerm *t) {
+    PureLeaves pl = { { NULL, NULL, NULL, NULL } };
+    SKITerm *r = expand_pure(p, t, &pl);
+    for (int i = 0; i < 4; i++) ski_unref(p, pl.leaf[i]);   /* the result holds its own references */
+    return r;
+}
+
+bool ski_uses_words(SKITerm *t) {
+    if (!t) return false;
+    if (t->tag == TERM_APP) return ski_uses_words(t->app.left) || ski_uses_words(t->app.right);
+    return t->tag == TERM_WORD || t->tag == TERM_PRIM;
+}
+
+bool ski_uses_extended(SKITerm *t) {
+    if (!t) return false;
+    if (t->tag == TERM_APP) return ski_uses_extended(t->app.left) || ski_uses_extended(t->app.right);
+    return t->tag != TERM_S && t->tag != TERM_K && t->tag != TERM_I;
+}
+
 /*
  * Reference counting
  */
@@ -121,6 +231,12 @@ SKITerm *ski_copy(SKIPool *p, SKITerm *t) {
     case TERM_S: return ski_s(p);
     case TERM_K: return ski_k(p);
     case TERM_I: return ski_i(p);
+    case TERM_B: return ski_b(p);
+    case TERM_C: return ski_c(p);
+    case TERM_T: return ski_t(p);
+    case TERM_R: return ski_r(p);
+    case TERM_WORD: return ski_word(p, t->word);
+    case TERM_PRIM: return ski_prim(p, t->op);
     case TERM_APP: {
         SKITerm *left = ski_copy(p, t->app.left);
         if (!left) return NULL;
@@ -146,25 +262,31 @@ SKITerm *ski_copy(SKIPool *p, SKITerm *t) {
  * Reduction
  */
 
+/*
+ * A redex is a leaf applied to exactly its arity of arguments (a deeper spine
+ * is not: the redex sits further in, on the left). The spine is read up to
+ * three applications deep, which covers every arity.
+ */
+typedef struct { SKITerm *head; SKITerm *a[3]; int n; } Spine;
+
+/* t's head leaf and its arguments, a[0] nearest the head; n = -1 if the head is not a leaf within three applications */
+static void spine(SKITerm *t, Spine *s) {
+    SKITerm *args[3];
+    int n = 0;
+    SKITerm *cur = t;
+    while (cur->tag == TERM_APP && n < 3) { args[n++] = cur->app.right; cur = cur->app.left; }
+    if (cur->tag == TERM_APP) { s->n = -1; return; }
+    s->head = cur;
+    s->n = n;
+    for (int i = 0; i < n; i++) s->a[i] = args[n - 1 - i];
+}
+
 /* Check if node is a redex */
 static bool is_redex(SKITerm *t) {
     if (!t || t->tag != TERM_APP) return false;
-    SKITerm *left = t->app.left;
-    
-    /* I x → x */
-    if (left->tag == TERM_I) return true;
-    
-    /* K x y → x */
-    if (left->tag == TERM_APP && left->app.left->tag == TERM_K) return true;
-    
-    /* S x y z → xz(yz) */
-    if (left->tag == TERM_APP && 
-        left->app.left->tag == TERM_APP &&
-        left->app.left->app.left->tag == TERM_S) {
-        return true;
-    }
-    
-    return false;
+    Spine s;
+    spine(t, &s);
+    return s.n >= 0 && s.n == ski_arity(s.head->tag);
 }
 
 /* 
@@ -230,75 +352,80 @@ static SKITerm **find_redex(SKITerm **tp) {
     return NULL;
 }
 
+/* An application of two owned terms; on failure both are released and NULL returned */
+static SKITerm *app2(SKIPool *p, SKITerm *l, SKITerm *r) {
+    if (!l || !r) { ski_unref(p, l); ski_unref(p, r); return NULL; }
+    SKITerm *t = ski_app(p, l, r);
+    if (!t) { ski_unref(p, l); ski_unref(p, r); }
+    return t;
+}
+
+/* pair x y = \p. p x y = C (T x) y */
+static SKITerm *mk_pair(SKIPool *p, SKITerm *x, SKITerm *y) {
+    return app2(p, app2(p, ski_c(p), app2(p, ski_t(p), x)), y);
+}
+
+/* true = K, false = K I */
+static SKITerm *mk_bool(SKIPool *p, int b) {
+    return b ? ski_k(p) : app2(p, ski_k(p), ski_i(p));
+}
+
+SKITerm *prim_apply(SKIPool *p, PrimOp op, u64 a, u64 b) {
+    switch (op) {
+    case PRIM_ADD: return ski_word(p, a + b);
+    case PRIM_SUB: return ski_word(p, a - b);
+    case PRIM_MUL: return ski_word(p, a * b);
+    case PRIM_AND: return ski_word(p, a & b);
+    case PRIM_OR:  return ski_word(p, a | b);
+    case PRIM_XOR: return ski_word(p, a ^ b);
+    case PRIM_SHL: return ski_word(p, b >= 64 ? 0 : a << b);
+    case PRIM_SHR: return ski_word(p, b >= 64 ? 0 : a >> b);
+    case PRIM_EQ:  return mk_bool(p, a == b);
+    case PRIM_LT:  return mk_bool(p, a < b);
+    case PRIM_ADDC: { u64 s = a + b; return mk_pair(p, ski_word(p, s), ski_word(p, s < a)); }
+    case PRIM_SUBB: return mk_pair(p, ski_word(p, a - b), ski_word(p, a < b));
+    case PRIM_MULL: {
+        unsigned __int128 m = (unsigned __int128)a * b;
+        return mk_pair(p, ski_word(p, (u64)m), ski_word(p, (u64)(m >> 64)));
+    }
+    case PRIM_DIVMOD:
+        if (b == 0) return mk_pair(p, ski_word(p, 0), ski_word(p, a));
+        return mk_pair(p, ski_word(p, a / b), ski_word(p, a % b));
+    default: return NULL;
+    }
+}
+
 /* Perform one reduction step at *tp. Returns true if reduced. */
 static bool reduce_step(SKIPool *p, SKITerm **tp) {
     SKITerm *t = *tp;
-    
-    if (t->tag != TERM_APP) return false;
-    
-    SKITerm *left = t->app.left;
-    SKITerm *right = t->app.right;
-    
-    /* I x → x */
-    if (left->tag == TERM_I) {
-        ski_ref(right);
-        ski_unref(p, t);
-        *tp = right;
-        return true;
+    if (!is_redex(t)) return false;
+    Spine s;
+    spine(t, &s);
+    SKITerm *x = s.a[0], *y = s.n > 1 ? s.a[1] : NULL, *z = s.n > 2 ? s.a[2] : NULL;
+    SKITerm *r = NULL;
+    switch (s.head->tag) {
+    case TERM_I: r = ski_ref(x); break;                                                          /* I x -> x */
+    case TERM_K: r = ski_ref(x); break;                                                          /* K x y -> x */
+    case TERM_S: r = app2(p, app2(p, ski_ref(x), ski_ref(z)), app2(p, ski_ref(y), ski_ref(z))); break;  /* S x y z -> x z (y z) */
+    case TERM_B: r = app2(p, ski_ref(x), app2(p, ski_ref(y), ski_ref(z))); break;                /* B x y z -> x (y z) */
+    case TERM_C: r = app2(p, app2(p, ski_ref(x), ski_ref(z)), ski_ref(y)); break;                /* C x y z -> x z y */
+    case TERM_T: r = app2(p, ski_ref(y), ski_ref(x)); break;                                     /* T x y -> y x */
+    case TERM_R: r = app2(p, app2(p, ski_ref(y), ski_ref(z)), ski_ref(x)); break;                /* R x y z -> y z x */
+    case TERM_WORD: r = app2(p, ski_ref(x), ski_ref(s.head)); break;                             /* #w f -> f #w */
+    case TERM_PRIM:
+        if (x->tag != TERM_WORD)                                                                 /* op x y -> x (B y op) */
+            r = app2(p, ski_ref(x), app2(p, app2(p, ski_b(p), ski_ref(y)), ski_ref(s.head)));
+        else if (y->tag != TERM_WORD)                                                            /* op x y -> y (op x) */
+            r = app2(p, ski_ref(y), app2(p, ski_ref(s.head), ski_ref(x)));
+        else
+            r = prim_apply(p, s.head->op, x->word, y->word);
+        break;
+    default: return false;
     }
-    
-    /* K x y → x */
-    if (left->tag == TERM_APP && left->app.left->tag == TERM_K) {
-        SKITerm *x = left->app.right;
-        ski_ref(x);
-        ski_unref(p, t);
-        *tp = x;
-        return true;
-    }
-    
-    /* S x y z → xz(yz) */
-    if (left->tag == TERM_APP && 
-        left->app.left->tag == TERM_APP &&
-        left->app.left->app.left->tag == TERM_S) {
-        SKITerm *x = left->app.left->app.right;
-        SKITerm *y = left->app.right;
-        SKITerm *z = right;
-        
-        /* Build xz */
-        ski_ref(x);
-        ski_ref(z);
-        SKITerm *xz = ski_app(p, x, z);
-        if (!xz) {
-            ski_unref(p, x);
-            ski_unref(p, z);
-            return false;
-        }
-        
-        /* Build yz */
-        ski_ref(y);
-        ski_ref(z);
-        SKITerm *yz = ski_app(p, y, z);
-        if (!yz) {
-            ski_unref(p, xz);
-            ski_unref(p, y);
-            ski_unref(p, z);
-            return false;
-        }
-        
-        /* Build xz(yz) */
-        SKITerm *result = ski_app(p, xz, yz);
-        if (!result) {
-            ski_unref(p, xz);
-            ski_unref(p, yz);
-            return false;
-        }
-        
-        ski_unref(p, t);
-        *tp = result;
-        return true;
-    }
-    
-    return false;
+    if (!r) return false;
+    ski_unref(p, t);
+    *tp = r;
+    return true;
 }
 
 /*
@@ -374,6 +501,12 @@ void ski_fprint(FILE *f, SKITerm *t) {
         case TERM_S: fprintf(f, "S"); break;
         case TERM_K: fprintf(f, "K"); break;
         case TERM_I: fprintf(f, "I"); break;
+        case TERM_B: fprintf(f, "B"); break;
+        case TERM_C: fprintf(f, "C"); break;
+        case TERM_T: fprintf(f, "T"); break;
+        case TERM_R: fprintf(f, "R"); break;
+        case TERM_WORD: fprintf(f, "#%llu", (unsigned long long)t->word); break;
+        case TERM_PRIM: fprintf(f, "#%s", prim_name(t->op)); break;
         case TERM_APP:
             fprintf(f, "(");
             ski_fprint(f, t->app.left);
