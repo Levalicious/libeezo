@@ -58,9 +58,13 @@ typedef enum {
     PRIM_WORD_COUNT,        /* the machine words' primitives end here: ADD ... DIVMOD */
     /* Limb primitives (2026-09-16), arity 2 on the limb list, named for the word primitives they
      * lift. BADD BSUB BMUL are bn_add, bn_monus, bn_mul; BDIVMOD is the Scott pair (quotient,
-     * remainder), with x / 0 = 0 and x % 0 = x; BLT BEQ are a Scott boolean on bn_cmp. A machine
-     * word is accepted where a list is, as its one limb. */
+     * remainder), with x / 0 = 0 and x % 0 = x; BLT BEQ are a Scott boolean on bn_cmp; BPOW is
+     * bn_pow, the successor recursion x ^ s(y) = x * x ^ y in one pass; BMINV is the modular
+     * inverse minv x y = x ^ (y - 2) mod y (Fermat: y's inverse is a divisor of it). The rest of
+     * the arithmetic (truthy, select, min, max, truncated difference) is equations over these, not
+     * primitives. A machine word is accepted where a list is, as its one limb. */
     PRIM_BADD = PRIM_WORD_COUNT, PRIM_BSUB, PRIM_BMUL, PRIM_BDIVMOD, PRIM_BLT, PRIM_BEQ,
+    PRIM_BPOW, PRIM_BMINV,
     PRIM_COUNT
 } PrimOp;
 
