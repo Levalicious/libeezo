@@ -2035,6 +2035,11 @@ static u64 build_term_recursive(NativeJIT *jit, SKITerm *term, u8 **hp_ptr) {
             return (u64)((u8*)jit->data + DATA_PRIM_R);
         case TERM_PRIM:
             return (u64)((u8*)jit->data + DATA_PRIM_OPS + 16 * (u64)term->op);
+        case TERM_BIG:
+            /* A limb list has no closure here: it runs on the simple interpreter. main.c refuses one
+               before the JIT is entered, so this is the backstop, not a path. */
+            ski_refuse_limb("the native JIT");
+
         case TERM_WORD: {
             /* Word[w] - 2 words */
             u64 *w = (u64*)*hp_ptr;
@@ -2061,8 +2066,11 @@ static u64 build_term_recursive(NativeJIT *jit, SKITerm *term, u8 **hp_ptr) {
         }
     }
     
-    fprintf(stderr, "native: term tag %d has no closure yet\n", (int)term->tag);
-    abort();
+    /* The limb list (TERM_BIG) has no closure here: its primitives are the C list itself (bn.c) and
+       they run on the simple interpreter. main.c refuses a program that uses one before the JIT is
+       entered, so this is the guard's backstop, not a path. */
+    fprintf(stderr, "native: the limb list has no closure here: it runs on the simple interpreter (-s)\n");
+    exit(1);
 }
 
 /*
@@ -2350,11 +2358,16 @@ static u32 calc_term_size(SKITerm *term) {
             return 0;  /* singletons in the data section */
         case TERM_WORD:
             return 16;
+        case TERM_BIG:
+            ski_refuse_limb("the native JIT");   /* the backstop: main.c refuses a limb list first */
         case TERM_APP:
             return 24 + calc_term_size(term->app.left) + calc_term_size(term->app.right);
     }
-    fprintf(stderr, "native: term tag %d has no closure\n", (int)term->tag);
-    abort();
+    /* The limb list (TERM_BIG) has no closure here: its primitives are the C list itself (bn.c) and
+       they run on the simple interpreter. main.c refuses a program that uses one before the JIT is
+       entered, so this is the guard's backstop, not a path. */
+    fprintf(stderr, "native: the limb list has no closure here: it runs on the simple interpreter (-s)\n");
+    exit(1);
 }
 
 /*
@@ -2393,6 +2406,9 @@ static u64 build_term_for_elf(SKITerm *term, u8 *buf, u64 buf_vaddr, u32 *hp,
             return data_vaddr + DATA_PRIM_R;
         case TERM_PRIM:
             return data_vaddr + DATA_PRIM_OPS + 16 * (u64)term->op;
+        case TERM_BIG:
+            ski_refuse_limb("the native JIT");   /* the backstop: main.c refuses a limb list first */
+
         case TERM_WORD: {
             u32 offset = *hp;
             *hp += 16;
@@ -2420,8 +2436,11 @@ static u64 build_term_for_elf(SKITerm *term, u8 *buf, u64 buf_vaddr, u32 *hp,
             return buf_vaddr + offset;
         }
     }
-    fprintf(stderr, "native: term tag %d has no closure\n", (int)term->tag);
-    abort();
+    /* The limb list (TERM_BIG) has no closure here: its primitives are the C list itself (bn.c) and
+       they run on the simple interpreter. main.c refuses a program that uses one before the JIT is
+       entered, so this is the guard's backstop, not a path. */
+    fprintf(stderr, "native: the limb list has no closure here: it runs on the simple interpreter (-s)\n");
+    exit(1);
 }
 
 /*

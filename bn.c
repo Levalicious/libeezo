@@ -30,6 +30,13 @@ static Bn *bn_norm(Bn *b) {
 }
 
 Bn *bn_from_u64(u64 x) { Bn *b = bn_alloc(1); b->limb[0] = x; return bn_norm(b); }
+Bn *bn_from_limbs(const u64 *limb, int n) {
+    Bn *b = bn_alloc(n);
+    if (n) memcpy(b->limb, limb, (size_t)n * sizeof(u64));
+    return bn_norm(b);
+}
+Bn *bn_copy(const Bn *a) { return bn_from_limbs(a->limb, a->n); }
+void bn_free(Bn *a) { if (!a) return; free(a->limb); free(a); }
 int bn_is_zero(const Bn *a) { return a->n == 0; }
 int bn_to_u64(const Bn *a, u64 *out) { if (a->n > 1) return 0; *out = a->n ? a->limb[0] : 0; return 1; }
 

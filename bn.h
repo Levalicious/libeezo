@@ -19,6 +19,9 @@ typedef struct { u64 *limb; int n; } Bn;
 
 Bn *bn_from_u64(u64 x);
 Bn *bn_from_dec(const char *s);          /* decimal digits; NULL if not */
+Bn *bn_from_limbs(const u64 *limb, int n);  /* little-endian, as the list reads; normalized */
+Bn *bn_copy(const Bn *a);                /* freshly allocated, canonical */
+void bn_free(Bn *a);                     /* and nothing else refers to it */
 char *bn_to_dec(const Bn *a);            /* freshly allocated */
 int bn_is_zero(const Bn *a);
 int bn_cmp(const Bn *a, const Bn *b);

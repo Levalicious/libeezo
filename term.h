@@ -9,6 +9,7 @@
 
 #include <stdio.h>
 #include "types.h"
+#include "bn.h"     /* Bn: the limb list a TERM_BIG carries */
 
 typedef enum {
     TERM_S,
@@ -28,7 +29,18 @@ typedef enum {
     TERM_T,
     TERM_R,
     TERM_WORD,      /* a u64 */
-    TERM_PRIM,      /* a word primitive, of arity 2 */
+    TERM_PRIM,      /* a primitive, of arity 2: a machine word's, or a limb list's */
+    /* The limb list (2026-09-16). A natural of the theory's limb layer is, at run time, the C list
+     * of limbs itself: bn.h's Bn - little-endian u64 limbs, no leading zero - which is what a chain
+     * of machine words evaluates to. Every limb primitive IS that list evaluating itself directly
+     * (bn_add, bn_monus, bn_mul, Knuth D divmod: one pass of C per limb, not a fold unfolding), so
+     * sub is something the actual list in C evaluates straight to its result. A limb list applied
+     * passes itself on, as a word does:  b f = f b.  Its primitives force their arguments through
+     * that rule, and a machine word is a one-limb list (2^64 - 1 is literally a machine word):
+     *   op x y = x (B y op)   unless x is a limb list or a word,
+     *   op x y = y (op x)     unless y is a limb list or a word,
+     *   op a b = the C list's own answer. */
+    TERM_BIG,       /* a limb list: bn.h's Bn */
 } SKITag;
 
 /*
@@ -43,8 +55,17 @@ typedef enum {
 typedef enum {
     PRIM_ADD, PRIM_SUB, PRIM_MUL, PRIM_AND, PRIM_OR, PRIM_XOR, PRIM_SHL, PRIM_SHR,
     PRIM_EQ, PRIM_LT, PRIM_ADDC, PRIM_SUBB, PRIM_MULL, PRIM_DIVMOD,
+    PRIM_WORD_COUNT,        /* the machine words' primitives end here: ADD ... DIVMOD */
+    /* Limb primitives (2026-09-16), arity 2 on the limb list, named for the word primitives they
+     * lift. BADD BSUB BMUL are bn_add, bn_monus, bn_mul; BDIVMOD is the Scott pair (quotient,
+     * remainder), with x / 0 = 0 and x % 0 = x; BLT BEQ are a Scott boolean on bn_cmp. A machine
+     * word is accepted where a list is, as its one limb. */
+    PRIM_BADD = PRIM_WORD_COUNT, PRIM_BSUB, PRIM_BMUL, PRIM_BDIVMOD, PRIM_BLT, PRIM_BEQ,
     PRIM_COUNT
 } PrimOp;
+
+/* A limb primitive taking two limb lists (a word is one), rather than two machine words */
+static inline bool prim_is_limb(PrimOp op) { return op >= PRIM_WORD_COUNT && op < PRIM_COUNT; }
 
 typedef struct SKITerm SKITerm;
 
@@ -55,6 +76,7 @@ struct SKITerm {
         struct { SKITerm *left; SKITerm *right; } app;
         u64 word;       /* TERM_WORD */
         PrimOp op;      /* TERM_PRIM */
+        Bn *big;        /* TERM_BIG: the limb list, owned by the term */
     };
 };
 
@@ -83,6 +105,8 @@ SKITerm *ski_t(SKIPool *p);
 SKITerm *ski_r(SKIPool *p);
 SKITerm *ski_word(SKIPool *p, u64 w);
 SKITerm *ski_prim(SKIPool *p, PrimOp op);
+/* A limb list leaf, taking ownership of b (a fresh leaf on failure frees it and returns NULL) */
+SKITerm *ski_big(SKIPool *p, Bn *b);
 
 /* How many arguments a leaf takes before it reduces (a word: none, it is a value) */
 int ski_arity(SKITag tag);
@@ -90,17 +114,27 @@ int ski_arity(SKITag tag);
 const char *prim_name(PrimOp op);
 /* The pure S K spelling of a leaf, for the formats that have no extended leaves: a string over
  * '1' (application), 'S', 'K' and letters naming other leaves to expand in turn (I B C).
- * NULL for words and primitives, which have no such spelling. */
+ * NULL for words, limb lists and primitives, which have no such spelling. */
 const char *ski_expansion(SKITag tag);
 /* The term with B C T R replaced by their S K trees (one shared tree per leaf): what a pure format
  * carries. NULL if the term has words or primitives, which no pure spelling can carry. */
 SKITerm *ski_expand_pure(SKIPool *p, SKITerm *t);
 /* Does the term contain a word or a primitive anywhere? (then it needs XBCL or the ELF) */
 bool ski_uses_words(SKITerm *t);
-/* Does the term contain any extended leaf (B C T R, words, primitives)? */
+/* Does the term contain a limb list, or a limb primitive, anywhere? (the simple interpreter runs
+ * these: the limb primitives are the C list itself; the STG machine and the native JIT refuse them
+ * for now, main.c asks this before either is entered) */
+bool ski_uses_bigs(SKITerm *t);
+/* Refuse a limb list where the evaluator has none: it runs on the simple interpreter (-s), whose
+ * cells carry the C list (bn.h) directly. Never returns. */
+void ski_refuse_limb(const char *who);
+/* Does the term contain any extended leaf (B C T R, words, primitives, limb lists)? */
 bool ski_uses_extended(SKITerm *t);
 /* The value of a saturated primitive on two words: a fresh term, NULL if the pool is exhausted */
 SKITerm *prim_apply(SKIPool *p, PrimOp op, u64 a, u64 b);
+/* The value of a saturated limb primitive on two limb lists, each a TERM_BIG or a TERM_WORD (a word
+ * is its one limb): a fresh term, NULL if the pool is exhausted */
+SKITerm *prim_big_apply(SKIPool *p, PrimOp op, SKITerm *x, SKITerm *y);
 
 /* Reference counting */
 SKITerm *ski_ref(SKITerm *t);
