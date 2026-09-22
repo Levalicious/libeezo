@@ -200,15 +200,21 @@ char *bn_to_dec(const Bn *a) {
     const u64 TEN19 = 10000000000000000000ULL;
     Bn ten19 = { (u64[]){TEN19}, 1 };
     char *chunks = bn_bytes((size_t)a->n * 20 + 21);
-    int nchunks = 0; u64 *vals = bn_bytes((size_t)a->n * 2 + 2);
-    Bn *cur = (Bn *)a;
+    /* the chunk array holds u64s, so it is sized in u64s: a limb is one chunk and a fraction (19 digits
+       against 64 bits), so 2n + 2 of them always suffice. Sized in bytes until 2026-09-22, it was four
+       times too small - the heap came back as "double free or corruption" on every literal of a few
+       hundred limbs and was quietly overrun below that. */
+    int nchunks = 0; u64 *vals = bn_bytes(((size_t)a->n * 2 + 2) * sizeof(u64));
+    Bn *cur = bn_copy(a);   /* the working dividend, ours to free: the chunk loop allocated one per chunk and dropped it */
     while (cur->n > 0) {
         Bn *q, *r;
         bn_divmod(cur, &ten19, &q, &r);
         u64 v = 0; bn_to_u64(r, &v);
         vals[nchunks++] = v;
+        bn_free(r); bn_free(cur);
         cur = q;
     }
+    bn_free(cur);
     char *out = chunks; size_t pos = 0;
     pos += (size_t)sprintf(out + pos, "%llu", (unsigned long long)vals[nchunks - 1]);
     for (int i = nchunks - 2; i >= 0; i--) pos += (size_t)sprintf(out + pos, "%019llu", (unsigned long long)vals[i]);
