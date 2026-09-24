@@ -175,6 +175,40 @@ Bn *bn_pow(const Bn *a, const Bn *e) {
     return result;
 }
 
+/*
+ * a ^ e mod m (m != 0), by square and multiply with every product reduced: the cost is the size of the
+ * exponent and of the modulus, and a ^ e is never built. That is the difference between a number the
+ * machine can hold and a number it can only denote - 3 ^ (2 ^ 64) has no limbs to hold it in, but its
+ * residue modulo a machine-sized prime does, and this is how you get it.
+ */
+Bn *bn_powmod(const Bn *a, const Bn *e, const Bn *m) {
+    Bn *q, *r;
+    Bn *acc = bn_from_u64(1);
+    bn_divmod(acc, m, &q, &r); bn_free(q); bn_free(acc); acc = r;      /* 1 mod m */
+    Bn *base = bn_copy(a);
+    bn_divmod(base, m, &q, &r); bn_free(q); bn_free(base); base = r;   /* a mod m */
+    for (int i = bn_bitlen(e) - 1; i >= 0; i--) {
+        Bn *t = bn_mul(acc, acc); bn_free(acc); bn_divmod(t, m, &q, &r); bn_free(q); bn_free(t); acc = r;
+        if (bn_bit(e, i)) {
+            t = bn_mul(acc, base); bn_free(acc); bn_divmod(t, m, &q, &r); bn_free(q); bn_free(t); acc = r;
+        }
+    }
+    bn_free(base);
+    return acc;
+}
+
+/* minv x y = mod (pow x (y - 2)) y: the exponent is the modulus's own size, so the power is taken modulo
+   y all the way. The value is the one the definition names; computing the power first and dividing it
+   after is what made an inverse of a machine-sized modulus impossible. y <= 2 leaves the exponent 0, and
+   that is 1 mod y (x % 0 = x, so y = 0 gives 1). */
+Bn *bn_minv(const Bn *x, const Bn *y) {
+    Bn *two = bn_from_u64(2), *e = bn_monus(y, two), *r;
+    if (bn_is_zero(y)) r = bn_from_u64(1);
+    else r = bn_powmod(x, e, y);
+    bn_free(two); bn_free(e);
+    return r;
+}
+
 Bn *bn_succ(const Bn *a) { Bn one = { (u64[]){1}, 1 }; return bn_add(a, &one); }
 Bn *bn_pred(const Bn *a) { Bn one = { (u64[]){1}, 1 }; return bn_monus(a, &one); }
 

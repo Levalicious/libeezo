@@ -447,13 +447,7 @@ SKITerm *prim_big_apply(SKIPool *p, PrimOp op, SKITerm *x, SKITerm *y) {
     case PRIM_BLT: return mk_bool(p, bn_cmp(a, b) < 0);
     case PRIM_BEQ: return mk_bool(p, bn_cmp(a, b) == 0);
     case PRIM_BPOW: return ski_big(p, bn_pow(a, b));
-    case PRIM_BMINV: {
-        /* minv x y = x ^ (y - 2) mod y: Fermat, so y's inverse is the exponent's own divisor */
-        Bn *two = bn_from_u64(2), *e = bn_monus(b, two), *q, *r;
-        Bn *pw = bn_pow(a, e);
-        bn_divmod(pw, b, &q, &r);
-        return ski_big(p, r);
-    }
+    case PRIM_BMINV: return ski_big(p, bn_minv(a, b));   /* minv x y = x ^ (y - 2) mod y, never the power */
     default: return NULL;
     }
 }

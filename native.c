@@ -81,13 +81,7 @@ u64 *jit_limb_apply(u64 op, u64 x, u64 y, u64 *hp, u64 *limit, u64 *data) {
     case PRIM_BMUL: v = bn_mul(a, b); break;
     case PRIM_BPOW: v = bn_pow(a, b); break;
     case PRIM_BDIVMOD: bn_divmod(a, b, &q, &r); break;
-    case PRIM_BMINV: {   /* minv x y = x ^ (y - 2) mod y: Fermat, so y's inverse is the exponent's own divisor */
-        Bn *two = bn_from_u64(2), *e = bn_monus(b, two), *pw = bn_pow(a, e), *quo;
-        bn_divmod(pw, b, &quo, &r);
-        v = r; r = NULL;                      /* the inverse is the remainder, not the pair */
-        bn_free(quo); bn_free(two); bn_free(e); bn_free(pw);
-        break;
-    }
+    case PRIM_BMINV: v = bn_minv(a, b); break;   /* the inverse, taken modulo y all the way */
     default:
         fprintf(stderr, "native: unknown limb primitive %llu\n", (unsigned long long)op);
         exit(1);
