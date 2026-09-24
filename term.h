@@ -139,6 +139,7 @@ bool ski_uses_bigs(SKITerm *t);
  * cells carry the C list (bn.h) directly. Never returns. */
 void ski_refuse_limb(const char *who);
 void ski_refuse_den(const char *who);
+void ski_refuse_den_op(PrimOp op);   /* the operation wanted a number that no limb list holds */
 /* Does the term contain any extended leaf (B C T R, words, primitives, limb lists)? */
 bool ski_uses_extended(SKITerm *t);
 /* The value of a saturated primitive on two words: a fresh term, NULL if the pool is exhausted */

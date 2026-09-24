@@ -445,18 +445,9 @@ static const Bn *limb_of(SKITerm *t, Bn *tmp) {
     return tmp;
 }
 
-/* does a limb list hold base ^ exp? A Bn compare against the ceiling: the power is never built to ask */
-static int den_fits(const Bn *base, const Bn *exp) {
-    int bits = bn_bitlen(base);
-    if (bits <= 1) return 1;                 /* 0 ^ e and 1 ^ e are one limb at most */
-    Bn *room = bn_from_u64(((u64)BN_MAX_BYTES * 8) / (u64)bits);
-    int fits = bn_cmp(exp, room) <= 0;
-    bn_free(room);
-    return fits;
-}
 /* a ^ e: materialized when a limb list can hold it, denoted when none can (M17) */
 static SKITerm *den_make(SKIPool *p, Bn *base, Bn *exp) {
-    if (!den_fits(base, exp)) return ski_den(p, base, exp);
+    if (!bn_fits_pow(base, exp)) return ski_den(p, base, exp);
     SKITerm *t = ski_big(p, bn_pow(base, exp));
     bn_free(base); bn_free(exp);
     return t;
@@ -464,12 +455,12 @@ static SKITerm *den_make(SKIPool *p, Bn *base, Bn *exp) {
 /* the value itself, for a denoted number that has one: NULL when no limb list holds it */
 static const Bn *den_value(SKITerm *t, Bn **owned, Bn *tmp) {
     if (t->tag != TERM_DEN) return limb_of(t, tmp);
-    if (!den_fits(t->den.base, t->den.exp)) return NULL;
+    if (!bn_fits_pow(t->den.base, t->den.exp)) return NULL;
     *owned = bn_pow(t->den.base, t->den.exp);
     return *owned;
 }
 /* a number the machine can only denote reached an operation that wanted it held */
-static void den_refuse(PrimOp op) {
+void ski_refuse_den_op(PrimOp op) {
     fprintf(stderr, "eezo: %s needs a number this machine can hold, and its argument is only denoted: "
                     "the value is a power no limb list fits (M17)\n", prim_name(op));
     exit(1);
@@ -490,7 +481,7 @@ SKITerm *prim_big_apply(SKIPool *p, PrimOp op, SKITerm *x, SKITerm *y) {
         /* everything else wants the number itself: build the operands, or say why not */
         Bn *ox = NULL, *oy = NULL;
         const Bn *vx = den_value(x, &ox, &tx), *vy = den_value(y, &oy, &ty);
-        if (!vx || !vy) { bn_free(ox); bn_free(oy); den_refuse(op); }
+        if (!vx || !vy) { bn_free(ox); bn_free(oy); ski_refuse_den_op(op); }
         SKITerm *mx = ski_big(p, bn_copy(vx)), *my = ski_big(p, bn_copy(vy));
         bn_free(ox); bn_free(oy);
         SKITerm *r = (mx && my) ? prim_big_apply(p, op, mx, my) : NULL;

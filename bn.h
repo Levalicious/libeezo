@@ -36,6 +36,7 @@ Bn *bn_pow(const Bn *a, const Bn *e);
 /* a limb list lives in memory; past this it is not one, and a value that would need more is denoted
    rather than built (M17) */
 #define BN_MAX_BYTES ((size_t)1 << 30)
+int bn_fits_pow(const Bn *base, const Bn *exp);   /* does a limb list hold base ^ exp? A Bn compare */
 Bn *bn_powmod(const Bn *a, const Bn *e, const Bn *m);  /* a ^ e mod m, m != 0: never builds a ^ e */
 Bn *bn_minv(const Bn *x, const Bn *y);                 /* mod (pow x (sub y 2)) y, by the modular power */
 Bn *bn_succ(const Bn *a);

@@ -212,6 +212,16 @@ Bn *bn_powmod(const Bn *a, const Bn *e, const Bn *m) {
    y all the way. The value is the one the definition names; computing the power first and dividing it
    after is what made an inverse of a machine-sized modulus impossible. y <= 2 leaves the exponent 0, and
    that is 1 mod y (x % 0 = x, so y = 0 gives 1). */
+/* does a limb list hold base ^ exp? A Bn compare against the ceiling, never a built power */
+int bn_fits_pow(const Bn *base, const Bn *exp) {
+    int bits = bn_bitlen(base);
+    if (bits <= 1) return 1;                 /* 0 ^ e and 1 ^ e are one limb at most */
+    Bn *room = bn_from_u64(((u64)BN_MAX_BYTES * 8) / (u64)bits);
+    int fits = bn_cmp(exp, room) <= 0;
+    bn_free(room);
+    return fits;
+}
+
 Bn *bn_minv(const Bn *x, const Bn *y) {
     Bn *two = bn_from_u64(2), *e = bn_monus(y, two), *r;
     if (bn_is_zero(y)) r = bn_from_u64(1);
