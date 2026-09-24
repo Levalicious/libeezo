@@ -62,9 +62,77 @@ static u64 *jit_limb_put(u64 *p, u64 *data, const Bn *b) {
 static void jit_limb_retry(u64 *data, u64 words) {
     *(u64*)((u8*)data + DATA_ALLOC_REQUEST) = words * 8;
 }
+static u64 *jit_limb_apply_bn(u64 op, const Bn *a, const Bn *b, u64 *hp, u64 *limit, u64 *data);
+
+static int jit_is_den(u64 *c, u64 *data) { return c[0] == jit_table(data)[CLOS_DEN]; }
+/* a denoted closure's two limb lists, in place: the count and limbs of the base, then of the exponent */
+static void jit_den_of(u64 *c, Bn *b, Bn *e) {
+    b->limb = c + 2; b->n = (int)c[1];
+    e->limb = c + 3 + c[1]; e->n = (int)c[2 + c[1]];
+}
+/* a denoted number at p, both lists inline: the result is at the hp the caller passed */
+static u64 *jit_den_put(u64 *p, u64 *data, const Bn *base, const Bn *exp) {
+    p[0] = jit_table(data)[CLOS_DEN];
+    p[1] = (u64)base->n;
+    for (int i = 0; i < base->n; i++) p[2 + i] = base->limb[i];
+    p[2 + base->n] = (u64)exp->n;
+    for (int i = 0; i < exp->n; i++) p[3 + base->n + i] = exp->limb[i];
+    return p + 3 + (u64)base->n + (u64)exp->n;
+}
+/* base ^ exp: a limb list when one holds it, a denoted leaf when none does */
+static u64 *jit_den_make(u64 *hp, u64 *limit, u64 *data, Bn *base, Bn *exp) {
+    if (bn_fits_pow(base, exp)) {
+        Bn *v = bn_pow(base, exp);
+        u64 words = 2 + (u64)v->n;
+        if (hp + words > limit) { jit_limb_retry(data, words); bn_free(v); bn_free(base); bn_free(exp); return NULL; }
+        u64 *end = jit_limb_put(hp, data, v);
+        bn_free(v); bn_free(base); bn_free(exp);
+        return end;
+    }
+    u64 words = 3 + (u64)base->n + (u64)exp->n;
+    if (hp + words > limit) { jit_limb_retry(data, words); bn_free(base); bn_free(exp); return NULL; }
+    u64 *end = jit_den_put(hp, data, base, exp);
+    bn_free(base); bn_free(exp);
+    return end;
+}
+/* a limb list for a value that has one; NULL for a denoted one that no limb list holds (the caller refuses) */
+static const Bn *jit_operand_of(u64 *c, u64 *data, Bn *t1, Bn *t2, Bn **owned) {
+    if (!jit_is_den(c, data)) return jit_limb_of(c, data, t1);
+    Bn b, e; jit_den_of(c, &b, &e);
+    if (!bn_fits_pow(&b, &e)) return NULL;
+    *owned = bn_pow(&b, &e);
+    return *owned;
+}
 u64 *jit_limb_apply(u64 op, u64 x, u64 y, u64 *hp, u64 *limit, u64 *data) {
     Bn tx, ty;
+    /* a denoted number: the laws stdlib/tt proves, or the value itself, or the refusal - never a guess */
+    if (jit_is_den((u64*)x, data) || jit_is_den((u64*)y, data)) {
+        Bn o1, o2, o3, o4;
+        if (op == PRIM_BPOW && jit_is_den((u64*)x, data) && !jit_is_den((u64*)y, data)) {
+            Bn b; jit_den_of((u64*)x, &b, &o1);
+            Bn e = o1;
+            return jit_den_make(hp, limit, data, bn_copy(&b), bn_mul(&e, jit_limb_of((u64*)y, data, &o2)));
+        }
+        if (op == PRIM_BMUL && jit_is_den((u64*)x, data) && jit_is_den((u64*)y, data)) {
+            Bn bx; jit_den_of((u64*)x, &bx, &o1);
+            Bn by; jit_den_of((u64*)y, &by, &o2);
+            if (bn_cmp(&bx, &by) == 0) return jit_den_make(hp, limit, data, bn_copy(&bx), bn_add(&o1, &o2));
+        }
+        Bn *ox = NULL, *oy = NULL;
+        const Bn *vx = jit_operand_of((u64*)x, data, &tx, &o3, &ox);
+        const Bn *vy = jit_operand_of((u64*)y, data, &ty, &o4, &oy);
+        if (!vx || !vy) { bn_free(ox); bn_free(oy); ski_refuse_den_op((PrimOp)op); }
+        u64 *r = jit_limb_apply_bn(op, vx, vy, hp, limit, data);
+        bn_free(ox); bn_free(oy);
+        return r;
+    }
     const Bn *a = jit_limb_of((u64*)x, data, &tx), *b = jit_limb_of((u64*)y, data, &ty);
+    return jit_limb_apply_bn(op, a, b, hp, limit, data);
+}
+
+/* the value on two limb lists: the C list's own answer, one pass over the limbs (term.c's twin) */
+static u64 *jit_limb_apply_bn(u64 op, const Bn *a, const Bn *b, u64 *hp, u64 *limit, u64 *data) {
+    if (op == PRIM_BPOW) return jit_den_make(hp, limit, data, bn_copy(a), bn_copy(b));   /* built, or denoted */
     if (op == PRIM_BLT || op == PRIM_BEQ) {
         int cmp = bn_cmp(a, b), truth = op == PRIM_BLT ? cmp < 0 : cmp == 0;
         u64 words = truth ? 1 : 2;
@@ -448,10 +516,10 @@ static void emit_entry_ApplyK(NativeEmit *e) {
     static const ClosureType cases[] = {
         CLOS_S, CLOS_K, CLOS_I, CLOS_S1, CLOS_S2, CLOS_K1,
         CLOS_B, CLOS_C, CLOS_T, CLOS_R, CLOS_B1, CLOS_C1, CLOS_R1, CLOS_B2, CLOS_C2, CLOS_T1, CLOS_R2,
-        CLOS_WORD, CLOS_PRIM, CLOS_PRIM1, CLOS_BIG
+        CLOS_WORD, CLOS_PRIM, CLOS_PRIM1, CLOS_BIG, CLOS_DEN
     };
-    u32 p[21];
-    emit_dispatch(b, cases, 21, p);
+    u32 p[22];
+    emit_dispatch(b, cases, 22, p);
     x86_int3(b);                            /* a non-value reached a continuation */
     /* S x -> k(S1[x]) */
     x86_patch_rel32(b, p[0], x86_len(b));
@@ -609,6 +677,7 @@ static void emit_entry_ApplyK(NativeEmit *e) {
     /* Word[w] f -> eval(f, ApplyK[self, k])   (= f #w), and a limb list passes itself the same way */
     x86_patch_rel32(b, p[17], x86_len(b));
     x86_patch_rel32(b, p[20], x86_len(b));
+    x86_patch_rel32(b, p[21], x86_len(b));
     emit_bump(b, 3);
     emit_get_entry(b, RSI, CLOS_APPLYK);
     x86_mov_mr(b, RAX, 0, RSI);
@@ -640,8 +709,11 @@ static void emit_entry_ApplyK(NativeEmit *e) {
     emit_get_entry(b, RAX, CLOS_BIG);
     x86_cmp_rr(b, RSI, RAX);
     u32 xlimb = emit_jcc(b, CC_E);
+    emit_get_entry(b, RAX, CLOS_DEN);
+    x86_cmp_rr(b, RSI, RAX);
+    u32 xden = emit_jcc(b, CC_E);
     u32 rule2 = x86_len(b) + 1; x86_jmp_rel(b, 0);
-    x86_patch_rel32(b, xword, x86_len(b)); x86_patch_rel32(b, xlimb, x86_len(b));
+    x86_patch_rel32(b, xword, x86_len(b)); x86_patch_rel32(b, xlimb, x86_len(b)); x86_patch_rel32(b, xden, x86_len(b));
     x86_mov_rr(b, R9, RCX);                     /* y */
     emit_follow_ind_reg(b, R9);
     emit_get_entry(b, RAX, CLOS_WORD);
@@ -650,8 +722,11 @@ static void emit_entry_ApplyK(NativeEmit *e) {
     emit_get_entry(b, RAX, CLOS_BIG);
     x86_cmp_rr(b, RSI, RAX);
     u32 ylimb = emit_jcc(b, CC_E);
+    emit_get_entry(b, RAX, CLOS_DEN);
+    x86_cmp_rr(b, RSI, RAX);
+    u32 yden = emit_jcc(b, CC_E);
     u32 rule3 = x86_len(b) + 1; x86_jmp_rel(b, 0);
-    x86_patch_rel32(b, yword, x86_len(b)); x86_patch_rel32(b, ylimb, x86_len(b));
+    x86_patch_rel32(b, yword, x86_len(b)); x86_patch_rel32(b, ylimb, x86_len(b)); x86_patch_rel32(b, yden, x86_len(b));
     x86_mov_rm(b, R10, R14, 16);                /* op */
     x86_cmp_ri(b, R10, PRIM_WORD_COUNT);
     u32 wordop = emit_jcc(b, CC_B);
@@ -875,14 +950,14 @@ static void emit_entry_Norm(NativeEmit *e) {
     emit_reserve(e, 5, top);
     x86_mov_rm(b, RDX, RDI, 8);             /* k */
     x86_mov_rm(b, RSI, R14, 0);             /* v entry */
-    static const ClosureType prims[] = { CLOS_S, CLOS_K, CLOS_I, CLOS_B, CLOS_C, CLOS_T, CLOS_R, CLOS_WORD, CLOS_PRIM, CLOS_BIG };
+    static const ClosureType prims[] = { CLOS_S, CLOS_K, CLOS_I, CLOS_B, CLOS_C, CLOS_T, CLOS_R, CLOS_WORD, CLOS_PRIM, CLOS_BIG, CLOS_DEN };
     static const ClosureType paps[]  = { CLOS_S1, CLOS_K1, CLOS_S2, CLOS_B1, CLOS_B2, CLOS_C1, CLOS_C2, CLOS_T1, CLOS_R1, CLOS_R2, CLOS_PRIM1 };
-    u32 pp[10], pq[11];
-    emit_dispatch(b, prims, 10, pp);
+    u32 pp[11], pq[11];
+    emit_dispatch(b, prims, 11, pp);
     emit_dispatch(b, paps, 11, pq);
     x86_int3(b);
-    /* primitive or limb list: already normal */
-    for (int i = 0; i < 10; i++) x86_patch_rel32(b, pp[i], x86_len(b));
+    /* a primitive, a limb list or a denoted number: already normal */
+    for (int i = 0; i < 11; i++) x86_patch_rel32(b, pp[i], x86_len(b));
     x86_mov_rr(b, RBX, RDX);
     emit_call_cont(b);
     /* partial application: eval(v.x, Norm[Field1[v, k]]) */
@@ -993,12 +1068,28 @@ static void emit_classify(NativeEmit *e) {
     for (int t = 0; t < CLOS_COUNT; t++) {
         x86_patch_rel32(b, p[t], x86_len(b));
         if (t == CLOS_BIG) {
-            /* The limb list is the one closure whose size is not a constant: the entry, the limb count,
-               then the limbs. RDI holds the closure (both callers pass it), so the count is at [rdi + 8]. */
+            /* The limb list is a closure whose size is not a constant: the entry, the limb count, then the
+               limbs. RDI holds the closure (both callers pass it), so the count is at [rdi + 8]. */
             x86_mov_ri(b, RCX, 0);                       /* the limbs are data: no pointer fields */
             x86_mov_rm(b, RDX, RDI, 8);                  /* the limb count */
             x86_add_ri(b, RDX, 2);
             emit_shl_ri(b, RDX, 3);                      /* (2 + n) words, in bytes */
+            x86_ret(b);
+            continue;
+        }
+        if (t == CLOS_DEN) {
+            /* Two limb lists in one leaf: entry, the base's count and limbs, the exponent's count and
+               limbs. RDI holds the closure, so the exponent's count sits 2 + n words further on. */
+            x86_mov_ri(b, RCX, 0);                       /* a leaf, like the limb list: no pointers */
+            x86_mov_rm(b, RDX, RDI, 8);                  /* the base's limb count */
+            x86_mov_rr(b, R8, RDX);
+            x86_add_ri(b, R8, 2);
+            emit_shl_ri(b, R8, 3);                       /* in bytes, that is where the exponent's count is */
+            x86_add_rr(b, R8, RDI);
+            x86_mov_rm(b, R8, R8, 0);                    /* the exponent's limb count */
+            x86_add_rr(b, RDX, R8);
+            x86_add_ri(b, RDX, 3);                       /* the entry, both counts, both limb sets */
+            emit_shl_ri(b, RDX, 3);
             x86_ret(b);
             continue;
         }
@@ -1817,6 +1908,27 @@ static void emit_top_bits(X86Buf *b, int count) {
     x86_patch_rel32(b, done, x86_len(b));
 }
 
+/* a limb list as its own leaf, from the address of its count word in `reg` - which is where a BIG keeps it
+   and where each half of a DEN does. Writes the code, the count, then the limbs least significant first.
+   Clobbers R12, R13, R14, RBX and the bit writer's registers; R10 is left alone, so a DEN can call it twice. */
+static void emit_limb_leaf(X86Buf *b, X86Reg reg) {
+    emit_bits(b, "01111100");                        /* 011 and XB_BIG's five bits */
+    x86_lea(b, R12, reg, 8);                         /* the limbs first: they start one word past the count */
+    x86_mov_rm(b, R14, reg, 0);                      /* the limb count */
+    x86_mov_rr(b, RBX, R14);
+    emit_shl_ri(b, RBX, 32);                         /* emit_top_bits writes the top bits, like the word's 64 */
+    emit_top_bits(b, 32);
+    u32 bloop = x86_len(b);
+    x86_cmp_ri(b, R14, 0);
+    u32 bdone = emit_jcc(b, CC_E);
+    x86_mov_rm(b, RBX, R12, 0);
+    x86_add_ri(b, R12, 8);
+    x86_sub_ri(b, R14, 1);
+    emit_top_bits(b, 64);
+    emit_jmp_back(b, bloop);
+    x86_patch_rel32(b, bdone, x86_len(b));
+}
+
 static void emit_output_terms(NativeEmit *e) {
     X86Buf *b = &e->code;
     OutputFormat fmt = e->output_fmt;
@@ -1876,12 +1988,13 @@ static void emit_output_terms(NativeEmit *e) {
     static const int one_head[]       = { DATA_PRIM_S, DATA_PRIM_K, DATA_PRIM_B, DATA_PRIM_C, DATA_PRIM_T, DATA_PRIM_R, -1 };
     static const ClosureType two[]    = { CLOS_S2, CLOS_B2, CLOS_C2, CLOS_R2 };
     static const int two_head[]       = { DATA_PRIM_S, DATA_PRIM_B, DATA_PRIM_C, DATA_PRIM_R };
-    u32 pl[7], p1[7], p2[4], pw, pb, pp, pa;
+    u32 pl[7], p1[7], p2[4], pw, pb, pd, pp, pa;
     for (int i = 0; i < 7; i++) { emit_get_entry(b, RAX, leaves[i]); x86_cmp_rr(b, RDX, RAX); pl[i] = emit_jcc(b, CC_E); }
     for (int i = 0; i < 7; i++) { emit_get_entry(b, RAX, one[i]);    x86_cmp_rr(b, RDX, RAX); p1[i] = emit_jcc(b, CC_E); }
     for (int i = 0; i < 4; i++) { emit_get_entry(b, RAX, two[i]);    x86_cmp_rr(b, RDX, RAX); p2[i] = emit_jcc(b, CC_E); }
     emit_get_entry(b, RAX, CLOS_WORD); x86_cmp_rr(b, RDX, RAX); pw = emit_jcc(b, CC_E);
     emit_get_entry(b, RAX, CLOS_BIG);  x86_cmp_rr(b, RDX, RAX); pb = emit_jcc(b, CC_E);
+    emit_get_entry(b, RAX, CLOS_DEN);  x86_cmp_rr(b, RDX, RAX); pd = emit_jcc(b, CC_E);
     emit_get_entry(b, RAX, CLOS_PRIM); x86_cmp_rr(b, RDX, RAX); pp = emit_jcc(b, CC_E);
     emit_get_entry(b, RAX, CLOS_APP);  x86_cmp_rr(b, RDX, RAX); pa = emit_jcc(b, CC_E);
     x86_int3(b);   /* not a normal form */
@@ -1907,28 +2020,30 @@ static void emit_output_terms(NativeEmit *e) {
     /* a limb list: 011, XB_BIG's five bits, the 32-bit limb count, then each limb (least significant first) */
     x86_patch_rel32(b, pb, x86_len(b));
     if (fmt == OUTPUT_XBCL) {
-        char leaf[16]; int n = 0;
-        leaf[n++] = '0'; leaf[n++] = '1'; leaf[n++] = '1';
-        for (int i = 4; i >= 0; i--) leaf[n++] = ((XB_BIG >> i) & 1) ? '1' : '0';
-        leaf[n] = 0;
-        emit_bits(b, leaf);
-        x86_mov_rm(b, R14, R10, 8);                  /* the limb count (r14 and r12 are free out here) */
-        x86_mov_rr(b, RBX, R14);
-        emit_shl_ri(b, RBX, 32);                     /* emit_top_bits writes the top bits, like the word's 64 */
-        emit_top_bits(b, 32);
-        x86_lea(b, R12, R10, 16);                    /* the limbs themselves */
-        u32 bloop = x86_len(b);
-        x86_cmp_ri(b, R14, 0);
-        u32 bdone = emit_jcc(b, CC_E);
-        x86_mov_rm(b, RBX, R12, 0);
-        x86_add_ri(b, R12, 8);
-        x86_sub_ri(b, R14, 1);
-        emit_top_bits(b, 64);
-        emit_jmp_back(b, bloop);
-        x86_patch_rel32(b, bdone, x86_len(b));
+        x86_lea(b, R14, R10, 8);                     /* a BIG's count is its second word; the leaf is the helper's */
+        emit_limb_leaf(b, R14);
         emit_jmp_back(b, loop_start);
     } else {
         emit_die(b, qword_of("limbs ne"), qword_of("ed xbcl\n"), 1);
+    }
+    /* a denoted number: 011, XB_DEN's five bits, then a limb leaf for each of its two lists */
+    x86_patch_rel32(b, pd, x86_len(b));
+    if (fmt == OUTPUT_XBCL) {
+        char dleaf[16]; int dn = 0;
+        dleaf[dn++] = '0'; dleaf[dn++] = '1'; dleaf[dn++] = '1';
+        for (int i = 4; i >= 0; i--) dleaf[dn++] = ((XB_DEN >> i) & 1) ? '1' : '0';
+        dleaf[dn] = 0;
+        emit_bits(b, dleaf);
+        x86_lea(b, R14, R10, 8);                     /* the base's count is the DEN's second word */
+        emit_limb_leaf(b, R14);
+        x86_mov_rm(b, R14, R10, 8);                  /* the exponent's: past the base's count and limbs */
+        x86_add_ri(b, R14, 2);                       /* the entry and both counts, plus the base's words */
+        emit_shl_ri(b, R14, 3);
+        x86_add_rr(b, R14, R10);
+        emit_limb_leaf(b, R14);
+        emit_jmp_back(b, loop_start);
+    } else {
+        emit_die(b, qword_of("denoted "), qword_of("needs xb"), 1);
     }
     x86_patch_rel32(b, pp, x86_len(b));
     if (fmt == OUTPUT_XBCL) {
@@ -2007,9 +2122,9 @@ void native_emit_runtime(NativeEmit *e) {
     emit_entry_K1(e);
     static const ClosureType values[] = {
         CLOS_B, CLOS_C, CLOS_T, CLOS_R, CLOS_B1, CLOS_B2, CLOS_C1, CLOS_C2, CLOS_T1, CLOS_R1, CLOS_R2,
-        CLOS_WORD, CLOS_PRIM, CLOS_PRIM1, CLOS_BIG
+        CLOS_WORD, CLOS_PRIM, CLOS_PRIM1, CLOS_BIG, CLOS_DEN
     };
-    for (int i = 0; i < 15; i++) emit_entry_value(e, values[i]);
+    for (int i = 0; i < 16; i++) emit_entry_value(e, values[i]);
     /* Thunks and continuations */
     emit_entry_App(e);
     emit_entry_Ind(e);
@@ -2205,8 +2320,17 @@ static u64 build_term_recursive(NativeJIT *jit, SKITerm *term, u8 **hp_ptr) {
             return (u64)((u8*)jit->data + DATA_PRIM_R);
         case TERM_PRIM:
             return (u64)((u8*)jit->data + DATA_PRIM_OPS + 16 * (u64)term->op);
-        case TERM_DEN:
-            ski_refuse_den("the native JIT");   /* the denoted kind is the simple interpreter's for now */
+        case TERM_DEN: {
+            /* Den[n, base..., m, exp...] - one leaf of 3 + n + m words, both limb lists inline */
+            u64 *d = (u64*)*hp_ptr;
+            *hp_ptr += 8 * (3 + (u64)term->den.base->n + (u64)term->den.exp->n);
+            d[0] = data[(DATA_ENTRY_TABLE / 8) + CLOS_DEN];
+            d[1] = (u64)term->den.base->n;
+            for (int i = 0; i < term->den.base->n; i++) d[2 + i] = term->den.base->limb[i];
+            d[2 + term->den.base->n] = (u64)term->den.exp->n;
+            for (int i = 0; i < term->den.exp->n; i++) d[3 + term->den.base->n + i] = term->den.exp->limb[i];
+            return (u64)d;
+        }
         case TERM_BIG: {
             /* Big[n, limbs...] - 2 + n words: the count, then the limbs, as bn.h reads them */
             u64 *b = (u64*)*hp_ptr;
@@ -2533,12 +2657,12 @@ static u32 calc_term_size(SKITerm *term) {
         case TERM_R:
         case TERM_PRIM:
             return 0;  /* singletons in the data section */
-        case TERM_DEN:
-            ski_refuse_den("the native JIT");
         case TERM_WORD:
             return 16;
         case TERM_BIG:
             return 16 + 8 * (u32)term->big->n;   /* the count, then the limbs */
+        case TERM_DEN:
+            return 24 + 8 * (u32)(term->den.base->n + term->den.exp->n);   /* both counts and both limb sets */
         case TERM_APP:
             return 24 + calc_term_size(term->app.left) + calc_term_size(term->app.right);
     }
@@ -2585,8 +2709,17 @@ static u64 build_term_for_elf(SKITerm *term, u8 *buf, u64 buf_vaddr, u32 *hp,
             return data_vaddr + DATA_PRIM_R;
         case TERM_PRIM:
             return data_vaddr + DATA_PRIM_OPS + 16 * (u64)term->op;
-        case TERM_DEN:
-            ski_refuse_den("the native JIT");
+        case TERM_DEN: {
+            u32 offset = *hp;
+            *hp += 24 + 8 * (u32)(term->den.base->n + term->den.exp->n);
+            u64 *d = (u64*)(buf + offset);
+            d[0] = code_vaddr + entry_offsets[CLOS_DEN];
+            d[1] = (u64)term->den.base->n;
+            for (int i = 0; i < term->den.base->n; i++) d[2 + i] = term->den.base->limb[i];
+            d[2 + term->den.base->n] = (u64)term->den.exp->n;
+            for (int i = 0; i < term->den.exp->n; i++) d[3 + term->den.base->n + i] = term->den.exp->limb[i];
+            return buf_vaddr + offset;
+        }
         case TERM_BIG: {
             u32 offset = *hp;
             *hp += 16 + 8 * (u32)term->big->n;
