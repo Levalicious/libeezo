@@ -185,7 +185,7 @@ u64 bcl_size(SKITerm *t) {
  * XBCL (see bcl.h)
  */
 
-_Static_assert(XB_BIG < 32, "the extended-leaf codes must fit five bits");   /* the codes are bcl.h's */
+_Static_assert(XB_DEN < 32, "the extended-leaf codes must fit five bits");   /* the codes are bcl.h's */
 
 static bool write_bits(BclBuffer *b, u64 v, int n) {
     for (int i = n - 1; i >= 0; i--)
@@ -248,6 +248,17 @@ SKITerm *xbcl_parse(SKIPool *p, BclStream *s) {
         free(limb);
         return ski_big(p, b);
     }
+    case XB_DEN: {
+        SKITerm *base = xbcl_parse(p, s), *exp = xbcl_parse(p, s);   /* both limb lists, as leaves */
+        if (!base || !exp || base->tag != TERM_BIG || exp->tag != TERM_BIG) {
+            if (base) ski_unref(p, base);
+            if (exp) ski_unref(p, exp);
+            return NULL;
+        }
+        SKITerm *t = ski_den(p, bn_copy(base->big), bn_copy(exp->big));
+        ski_unref(p, base); ski_unref(p, exp);
+        return t;
+    }
     default:
         if (code >= XB_PRIM0 && code < XB_PRIM0 + PRIM_COUNT) return ski_prim(p, (PrimOp)(code - XB_PRIM0));
         return NULL;
@@ -265,6 +276,13 @@ static int xb_code(SKITag tag) {
     }
 }
 
+/* a limb list as its own leaf: the code, a 32-bit limb count, then the limbs least significant first */
+static bool write_limb_leaf(BclBuffer *b, const Bn *a) {
+    if (!write_bits(b, 3, 3) || !write_bits(b, XB_BIG, 5) || !write_bits(b, (u64)a->n, 32)) return false;
+    for (int i = 0; i < a->n; i++) if (!write_bits(b, a->limb[i], 64)) return false;
+    return true;
+}
+
 bool xbcl_emit(SKITerm *t, BclBuffer *b) {
     if (!t) return false;
     switch (t->tag) {
@@ -272,10 +290,9 @@ bool xbcl_emit(SKITerm *t, BclBuffer *b) {
     case TERM_S: return write_bits(b, 2, 3);
     case TERM_APP: return bcl_buffer_write(b, 1) && xbcl_emit(t->app.left, b) && xbcl_emit(t->app.right, b);
     case TERM_WORD: return write_bits(b, 3, 3) && write_bits(b, XB_WORD, 5) && write_bits(b, t->word, 64);
-    case TERM_BIG:
-        if (!write_bits(b, 3, 3) || !write_bits(b, XB_BIG, 5) || !write_bits(b, (u64)t->big->n, 32)) return false;
-        for (int i = 0; i < t->big->n; i++) if (!write_bits(b, t->big->limb[i], 64)) return false;
-        return true;
+    case TERM_BIG: return write_limb_leaf(b, t->big);
+    case TERM_DEN:      /* a denoted number: the base's leaf, then the exponent's */
+        return write_bits(b, 3, 3) && write_bits(b, XB_DEN, 5) && write_limb_leaf(b, t->den.base) && write_limb_leaf(b, t->den.exp);
     case TERM_PRIM: return write_bits(b, 3, 3) && write_bits(b, XB_PRIM0 + t->op, 5);
     default: {
         int c = xb_code(t->tag);
@@ -292,6 +309,7 @@ u64 xbcl_size(SKITerm *t) {
     case TERM_APP: return 1 + xbcl_size(t->app.left) + xbcl_size(t->app.right);
     case TERM_WORD: return 3 + 5 + 64;
     case TERM_BIG: return 3 + 5 + 32 + 64 * (u64)t->big->n;
+    case TERM_DEN: return 3 + 5 + (3 + 5 + 32 + 64 * (u64)t->den.base->n) + (3 + 5 + 32 + 64 * (u64)t->den.exp->n);
     default: return 3 + 5;
     }
 }

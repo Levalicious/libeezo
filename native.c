@@ -2205,6 +2205,8 @@ static u64 build_term_recursive(NativeJIT *jit, SKITerm *term, u8 **hp_ptr) {
             return (u64)((u8*)jit->data + DATA_PRIM_R);
         case TERM_PRIM:
             return (u64)((u8*)jit->data + DATA_PRIM_OPS + 16 * (u64)term->op);
+        case TERM_DEN:
+            ski_refuse_den("the native JIT");   /* the denoted kind is the simple interpreter's for now */
         case TERM_BIG: {
             /* Big[n, limbs...] - 2 + n words: the count, then the limbs, as bn.h reads them */
             u64 *b = (u64*)*hp_ptr;
@@ -2531,6 +2533,8 @@ static u32 calc_term_size(SKITerm *term) {
         case TERM_R:
         case TERM_PRIM:
             return 0;  /* singletons in the data section */
+        case TERM_DEN:
+            ski_refuse_den("the native JIT");
         case TERM_WORD:
             return 16;
         case TERM_BIG:
@@ -2581,6 +2585,8 @@ static u64 build_term_for_elf(SKITerm *term, u8 *buf, u64 buf_vaddr, u32 *hp,
             return data_vaddr + DATA_PRIM_R;
         case TERM_PRIM:
             return data_vaddr + DATA_PRIM_OPS + 16 * (u64)term->op;
+        case TERM_DEN:
+            ski_refuse_den("the native JIT");
         case TERM_BIG: {
             u32 offset = *hp;
             *hp += 16 + 8 * (u32)term->big->n;

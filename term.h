@@ -41,6 +41,10 @@ typedef enum {
      *   op x y = y (op x)     unless y is a limb list or a word,
      *   op a b = the C list's own answer. */
     TERM_BIG,       /* a limb list: bn.h's Bn */
+    /* A denoted number (M17): a flat power a ^ b, both limb lists, for values no limb list can hold.
+     * It is a Nat like the limb list is, passes itself the same way, and the limb primitives act on it
+     * by the laws proved in stdlib/tt (pow_add, pow_mul) or materialize it when the result does fit. */
+    TERM_DEN,
 } SKITag;
 
 /*
@@ -81,6 +85,7 @@ struct SKITerm {
         u64 word;       /* TERM_WORD */
         PrimOp op;      /* TERM_PRIM */
         Bn *big;        /* TERM_BIG: the limb list, owned by the term */
+        struct { Bn *base, *exp; } den;   /* TERM_DEN: base ^ exp, both owned by the term */
     };
 };
 
@@ -111,6 +116,7 @@ SKITerm *ski_word(SKIPool *p, u64 w);
 SKITerm *ski_prim(SKIPool *p, PrimOp op);
 /* A limb list leaf, taking ownership of b (a fresh leaf on failure frees it and returns NULL) */
 SKITerm *ski_big(SKIPool *p, Bn *b);
+SKITerm *ski_den(SKIPool *p, Bn *base, Bn *exp);   /* base ^ exp, both taken over */
 
 /* How many arguments a leaf takes before it reduces (a word: none, it is a value) */
 int ski_arity(SKITag tag);
@@ -132,6 +138,7 @@ bool ski_uses_bigs(SKITerm *t);
 /* Refuse a limb list where the evaluator has none: it runs on the simple interpreter (-s), whose
  * cells carry the C list (bn.h) directly. Never returns. */
 void ski_refuse_limb(const char *who);
+void ski_refuse_den(const char *who);
 /* Does the term contain any extended leaf (B C T R, words, primitives, limb lists)? */
 bool ski_uses_extended(SKITerm *t);
 /* The value of a saturated primitive on two words: a fresh term, NULL if the pool is exhausted */

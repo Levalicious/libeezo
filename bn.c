@@ -172,7 +172,6 @@ void bn_divmod(const Bn *a, const Bn *b, Bn **q, Bn **r) {
  * no longer a number it can hold, and pow is where that line is crossed. (bn_powmod is where it is not:
  * the power modulo a modulus is a residue, and a residue is small.)
  */
-#define BN_MAX_BYTES ((size_t)1 << 30)     /* a limb list lives in memory; past this it is not one */
 Bn *bn_pow(const Bn *a, const Bn *e) {
     u64 ea, room = (u64)BN_MAX_BYTES * 8 / (u64)(bn_bitlen(a) > 0 ? bn_bitlen(a) : 1);
     if (bn_bitlen(a) > 1 && (!bn_to_u64(e, &ea) || ea > room))
