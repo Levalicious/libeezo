@@ -165,7 +165,19 @@ void bn_divmod(const Bn *a, const Bn *b, Bn **q, Bn **r) {
     free(vn); free(un);
 }
 
+/*
+ * pow is the one operation whose result the machine cannot always hold, and its size is known before the
+ * work starts: the base's bits times the exponent. 3 ^ (2 ^ 64) needs 2 ^ 65 bits and no limb list that
+ * long exists, so the machine says so instead of allocating towards it - a number it can only denote is
+ * no longer a number it can hold, and pow is where that line is crossed. (bn_powmod is where it is not:
+ * the power modulo a modulus is a residue, and a residue is small.)
+ */
+#define BN_MAX_BYTES ((size_t)1 << 30)     /* a limb list lives in memory; past this it is not one */
 Bn *bn_pow(const Bn *a, const Bn *e) {
+    u64 ea, room = (u64)BN_MAX_BYTES * 8 / (u64)(bn_bitlen(a) > 0 ? bn_bitlen(a) : 1);
+    if (bn_bitlen(a) > 1 && (!bn_to_u64(e, &ea) || ea > room))
+        resource_die("pow needs about %s bits: the result is a number no limb list can hold, and pow is not a residue",
+                     bn_bitlen(a) > 1 && !bn_to_u64(e, &ea) ? "2^64 or more" : "more than the heap");
     Bn *result = bn_from_u64(1), *base = (Bn *)a;
     int bits = bn_bitlen(e);
     for (int i = 0; i < bits; i++) {
