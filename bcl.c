@@ -185,11 +185,7 @@ u64 bcl_size(SKITerm *t) {
  * XBCL (see bcl.h)
  */
 
-enum { XB_I = 0, XB_B, XB_C, XB_T, XB_R, XB_WORD, XB_PRIM0,
-       /* A limb list follows the primitives: the code, a 32-bit limb count, then the limbs, least
-        * significant first. The range is five bits wide, so PRIM_COUNT must stay below 26. */
-       XB_BIG = XB_PRIM0 + PRIM_COUNT };
-_Static_assert(XB_BIG < 32, "the extended-leaf codes must fit five bits");
+_Static_assert(XB_BIG < 32, "the extended-leaf codes must fit five bits");   /* the codes are bcl.h's */
 
 static bool write_bits(BclBuffer *b, u64 v, int n) {
     for (int i = n - 1; i >= 0; i--)

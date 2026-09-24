@@ -36,6 +36,86 @@
  * Args in: rdi, rsi, rdx, r10, r8, r9
  * Result in: rax
  */
+/*
+ * The limb list's primitives, in C, on the JIT's own heap (M16b). The emitted Prim1[x, op] stub calls
+ * jit_limb_apply with the op, the two operands, the heap pointer, the limit and the data segment (the
+ * entry table and the K/I singletons). The result is written at the heap pointer passed in and the new
+ * heap pointer comes back; if it does not fit below the limit nothing is written, the bytes it wants go
+ * into the allocation request and 0 comes back, so the caller can collect and re-execute its entry.
+ */
+static u64 *jit_table(u64 *data) { return (u64*)((u8*)data + DATA_ENTRY_TABLE); }
+
+/* a closure's limbs as a Bn: a word is the one-limb list it stands for, and zero is the empty one */
+static const Bn *jit_limb_of(u64 *c, u64 *data, Bn *tmp) {
+    if (c[0] == jit_table(data)[CLOS_BIG]) { tmp->limb = c + 2; tmp->n = (int)c[1]; }
+    else { tmp->limb = c[1] ? &c[1] : NULL; tmp->n = c[1] ? 1 : 0; }
+    return tmp;
+}
+/* write a limb list at p; returns the word after it */
+static u64 *jit_limb_put(u64 *p, u64 *data, const Bn *b) {
+    p[0] = jit_table(data)[CLOS_BIG];
+    p[1] = (u64)b->n;
+    for (int i = 0; i < b->n; i++) p[2 + i] = b->limb[i];
+    return p + 2 + b->n;
+}
+/* tell the caller's retry path how many bytes the result wants */
+static void jit_limb_retry(u64 *data, u64 words) {
+    *(u64*)((u8*)data + DATA_ALLOC_REQUEST) = words * 8;
+}
+u64 *jit_limb_apply(u64 op, u64 x, u64 y, u64 *hp, u64 *limit, u64 *data) {
+    Bn tx, ty;
+    const Bn *a = jit_limb_of((u64*)x, data, &tx), *b = jit_limb_of((u64*)y, data, &ty);
+    if (op == PRIM_BLT || op == PRIM_BEQ) {
+        int cmp = bn_cmp(a, b), truth = op == PRIM_BLT ? cmp < 0 : cmp == 0;
+        u64 words = truth ? 1 : 2;
+        if (hp + words > limit) { jit_limb_retry(data, words); return NULL; }
+        if (truth) { hp[0] = *(u64*)((u8*)data + DATA_PRIM_K); return hp + 1; }
+        hp[0] = jit_table(data)[CLOS_K1];
+        hp[1] = (u64)((u8*)data + DATA_PRIM_I);
+        return hp + 2;
+    }
+    Bn *q = NULL, *r = NULL, *v = NULL;
+    switch (op) {
+    case PRIM_BADD: v = bn_add(a, b); break;
+    case PRIM_BSUB: v = bn_monus(a, b); break;
+    case PRIM_BMUL: v = bn_mul(a, b); break;
+    case PRIM_BPOW: v = bn_pow(a, b); break;
+    case PRIM_BDIVMOD: bn_divmod(a, b, &q, &r); break;
+    case PRIM_BMINV: {   /* minv x y = x ^ (y - 2) mod y: Fermat, so y's inverse is the exponent's own divisor */
+        Bn *two = bn_from_u64(2), *e = bn_monus(b, two), *pw = bn_pow(a, e), *quo;
+        bn_divmod(pw, b, &quo, &r);
+        v = r; r = NULL;                      /* the inverse is the remainder, not the pair */
+        bn_free(quo); bn_free(two); bn_free(e); bn_free(pw);
+        break;
+    }
+    default:
+        fprintf(stderr, "native: unknown limb primitive %llu\n", (unsigned long long)op);
+        exit(1);
+    }
+    /* the pair C2[T1[q], r], or the single list: the result is at the front of the block the caller finds */
+    u64 words = q ? 3 + 2 + (2 + (u64)r->n) + (2 + (u64)q->n) : 2 + (u64)v->n;
+    if (hp + words > limit) {
+        jit_limb_retry(data, words);
+        if (q) { bn_free(q); bn_free(r); } else bn_free(v);
+        return NULL;
+    }
+    if (!q) { u64 *end = jit_limb_put(hp, data, v); bn_free(v); return end; }
+    hp[0] = jit_table(data)[CLOS_C2];
+    hp[1] = (u64)(hp + 3);                      /* the T1 pap */
+    hp[2] = (u64)(hp + 5);                      /* r, the second component */
+    hp[3] = jit_table(data)[CLOS_T1];
+    hp[4] = (u64)(hp + 5 + 2 + (u64)r->n);      /* q, the first */
+    u64 *end = jit_limb_put(hp + 5, data, r);
+    end = jit_limb_put(end, data, q);
+    bn_free(q); bn_free(r);
+    return end;
+}
+static void jit_word_op_on_limb(u64 op) {
+    fprintf(stderr, "eezo: the word primitive %s takes machine words, not a limb list: "
+                    "the limb primitives (badd bsub bmul bdivmod blt beq) take limb lists\n", prim_name((PrimOp)op));
+    exit(1);
+}
+
 static void emit_syscall(X86Buf *b) {
     x86_byte(b, 0x0F);
     x86_byte(b, 0x05);
@@ -374,10 +454,10 @@ static void emit_entry_ApplyK(NativeEmit *e) {
     static const ClosureType cases[] = {
         CLOS_S, CLOS_K, CLOS_I, CLOS_S1, CLOS_S2, CLOS_K1,
         CLOS_B, CLOS_C, CLOS_T, CLOS_R, CLOS_B1, CLOS_C1, CLOS_R1, CLOS_B2, CLOS_C2, CLOS_T1, CLOS_R2,
-        CLOS_WORD, CLOS_PRIM, CLOS_PRIM1
+        CLOS_WORD, CLOS_PRIM, CLOS_PRIM1, CLOS_BIG
     };
-    u32 p[20];
-    emit_dispatch(b, cases, 20, p);
+    u32 p[21];
+    emit_dispatch(b, cases, 21, p);
     x86_int3(b);                            /* a non-value reached a continuation */
     /* S x -> k(S1[x]) */
     x86_patch_rel32(b, p[0], x86_len(b));
@@ -532,8 +612,9 @@ static void emit_entry_ApplyK(NativeEmit *e) {
     x86_mov_rr(b, RBX, RAX);
     x86_mov_rr(b, RDI, R9);
     emit_enter(b);
-    /* Word[w] f -> eval(f, ApplyK[self, k])   (= f #w) */
+    /* Word[w] f -> eval(f, ApplyK[self, k])   (= f #w), and a limb list passes itself the same way */
     x86_patch_rel32(b, p[17], x86_len(b));
+    x86_patch_rel32(b, p[20], x86_len(b));
     emit_bump(b, 3);
     emit_get_entry(b, RSI, CLOS_APPLYK);
     x86_mov_mr(b, RAX, 0, RSI);
@@ -553,18 +634,75 @@ static void emit_entry_ApplyK(NativeEmit *e) {
     x86_mov_rr(b, R14, RAX);
     x86_mov_rr(b, RBX, RDX);
     emit_call_cont(b);
-    /* Prim1[x, op] y: the three rules of term.h */
-    x86_patch_rel32(b, p[19], x86_len(b));
+    /* Prim1[x, op] y: the three rules of term.h. A limb list stands where a machine word does, so both
+       value tests accept either; which one it is matters again only below. */
+    u32 prim1_top = x86_len(b);
+    x86_patch_rel32(b, p[19], prim1_top);
     x86_mov_rm(b, R8, R14, 8);                  /* x */
     emit_follow_ind_reg(b, R8);
     emit_get_entry(b, RAX, CLOS_WORD);
     x86_cmp_rr(b, RSI, RAX);
-    u32 rule2 = emit_jcc(b, CC_NE);
+    u32 xword = emit_jcc(b, CC_E);
+    emit_get_entry(b, RAX, CLOS_BIG);
+    x86_cmp_rr(b, RSI, RAX);
+    u32 xlimb = emit_jcc(b, CC_E);
+    u32 rule2 = x86_len(b) + 1; x86_jmp_rel(b, 0);
+    x86_patch_rel32(b, xword, x86_len(b)); x86_patch_rel32(b, xlimb, x86_len(b));
     x86_mov_rr(b, R9, RCX);                     /* y */
     emit_follow_ind_reg(b, R9);
     emit_get_entry(b, RAX, CLOS_WORD);
     x86_cmp_rr(b, RSI, RAX);
-    u32 rule3 = emit_jcc(b, CC_NE);
+    u32 yword = emit_jcc(b, CC_E);
+    emit_get_entry(b, RAX, CLOS_BIG);
+    x86_cmp_rr(b, RSI, RAX);
+    u32 ylimb = emit_jcc(b, CC_E);
+    u32 rule3 = x86_len(b) + 1; x86_jmp_rel(b, 0);
+    x86_patch_rel32(b, yword, x86_len(b)); x86_patch_rel32(b, ylimb, x86_len(b));
+    x86_mov_rm(b, R10, R14, 16);                /* op */
+    x86_cmp_ri(b, R10, PRIM_WORD_COUNT);
+    u32 wordop = emit_jcc(b, CC_B);
+    /* a limb primitive: the C list of limbs (bn.c) answers in one pass. It may collect, so the operands
+       go where the collector finds them, and a result that does not fit re-executes this entry. */
+    x86_mov_rr(b, RBX, RDX);                    /* k, into the register the return paths use */
+    emit_store_data(b, DATA_GC_ROOT_VAL, RCX);  /* y arrived in an argument register: it needs a root */
+    x86_mov_rr(b, RSI, R8);                     /* x */
+    x86_mov_rr(b, RDX, RCX);                    /* y */
+    x86_mov_rr(b, RCX, R12);                    /* hp */
+    x86_mov_rr(b, R8, R13);                     /* limit */
+    x86_mov_rr(b, R9, R15);                     /* the data segment */
+    x86_mov_rr(b, RDI, R10);                    /* op */
+    x86_mov_ri(b, RAX, (u64)(void*)jit_limb_apply);
+    x86_call_r(b, RAX);
+    x86_mov_rr(b, RDI, R14);                    /* self, for the roots */
+    x86_cmp_ri(b, RAX, 0);
+    u32 fitted = emit_jcc(b, CC_NE);
+    emit_store_data(b, DATA_GC_ROOT_K, RBX);
+    emit_store_data(b, DATA_GC_ROOT_SELF, RDI);
+    x86_call_rel(b, 0);
+    e->gc_call_patch[e->n_gc_call++] = x86_len(b) - 4;
+    emit_load_data(b, RBX, DATA_GC_ROOT_K);
+    emit_load_data(b, RDI, DATA_GC_ROOT_SELF);
+    emit_load_data(b, RCX, DATA_GC_ROOT_VAL);
+    x86_mov_rr(b, R14, RDI);
+    emit_jmp_back(b, prim1_top);
+    x86_patch_rel32(b, fitted, x86_len(b));
+    x86_mov_rr(b, R14, R12);                    /* the result, written at the heap pointer we passed */
+    x86_mov_rr(b, R12, RAX);                    /* and the heap moves past it */
+    emit_call_cont(b);
+    x86_patch_rel32(b, wordop, x86_len(b));
+    /* a word primitive on a limb list has no meaning: refused, not looped */
+    emit_get_entry(b, RAX, CLOS_BIG);
+    x86_cmp_rm(b, RAX, R8, 0);
+    u32 xislimb = emit_jcc(b, CC_E);
+    x86_cmp_rm(b, RAX, R9, 0);
+    u32 yislimb = emit_jcc(b, CC_E);
+    u32 bothwords = x86_len(b) + 1; x86_jmp_rel(b, 0);
+    x86_patch_rel32(b, xislimb, x86_len(b)); x86_patch_rel32(b, yislimb, x86_len(b));
+    x86_mov_rr(b, RDI, R10);
+    x86_mov_ri(b, RAX, (u64)(void*)jit_word_op_on_limb);
+    x86_call_r(b, RAX);
+    x86_int3(b);
+    x86_patch_rel32(b, bothwords, x86_len(b));
     /* both words: compute. rax = a, rcx = b, r10 = op, r11 = k */
     x86_mov_rm(b, R10, R14, 16);
     x86_mov_rm(b, RAX, R8, 8);
@@ -743,14 +881,14 @@ static void emit_entry_Norm(NativeEmit *e) {
     emit_reserve(e, 5, top);
     x86_mov_rm(b, RDX, RDI, 8);             /* k */
     x86_mov_rm(b, RSI, R14, 0);             /* v entry */
-    static const ClosureType prims[] = { CLOS_S, CLOS_K, CLOS_I, CLOS_B, CLOS_C, CLOS_T, CLOS_R, CLOS_WORD, CLOS_PRIM };
+    static const ClosureType prims[] = { CLOS_S, CLOS_K, CLOS_I, CLOS_B, CLOS_C, CLOS_T, CLOS_R, CLOS_WORD, CLOS_PRIM, CLOS_BIG };
     static const ClosureType paps[]  = { CLOS_S1, CLOS_K1, CLOS_S2, CLOS_B1, CLOS_B2, CLOS_C1, CLOS_C2, CLOS_T1, CLOS_R1, CLOS_R2, CLOS_PRIM1 };
-    u32 pp[9], pq[11];
-    emit_dispatch(b, prims, 9, pp);
+    u32 pp[10], pq[11];
+    emit_dispatch(b, prims, 10, pp);
     emit_dispatch(b, paps, 11, pq);
     x86_int3(b);
-    /* primitive: already normal */
-    for (int i = 0; i < 9; i++) x86_patch_rel32(b, pp[i], x86_len(b));
+    /* primitive or limb list: already normal */
+    for (int i = 0; i < 10; i++) x86_patch_rel32(b, pp[i], x86_len(b));
     x86_mov_rr(b, RBX, RDX);
     emit_call_cont(b);
     /* partial application: eval(v.x, Norm[Field1[v, k]]) */
@@ -860,6 +998,16 @@ static void emit_classify(NativeEmit *e) {
     x86_int3(b);
     for (int t = 0; t < CLOS_COUNT; t++) {
         x86_patch_rel32(b, p[t], x86_len(b));
+        if (t == CLOS_BIG) {
+            /* The limb list is the one closure whose size is not a constant: the entry, the limb count,
+               then the limbs. RDI holds the closure (both callers pass it), so the count is at [rdi + 8]. */
+            x86_mov_ri(b, RCX, 0);                       /* the limbs are data: no pointer fields */
+            x86_mov_rm(b, RDX, RDI, 8);                  /* the limb count */
+            x86_add_ri(b, RDX, 2);
+            emit_shl_ri(b, RDX, 3);                      /* (2 + n) words, in bytes */
+            x86_ret(b);
+            continue;
+        }
         x86_mov_ri(b, RCX, CLOS_PTRS[t] * 8);
         x86_mov_ri(b, RDX, CLOS_SIZES[t] * 8);
         x86_ret(b);
@@ -920,6 +1068,7 @@ static void emit_scavenge(NativeEmit *e) {
     X86Buf *b = &e->code;
     e->gc_scavenge_offset = x86_len(b);
     x86_mov_rm(b, RSI, RBX, 0);
+    x86_mov_rr(b, RDI, RBX);                             /* classify reads the closure in RDI (the limb count) */
     x86_call_rel(b, 0); u32 cl = x86_len(b) - 4;         /* rcx = ptr bytes, rdx = size bytes */
     x86_push(b, RDX);
     x86_mov_rr(b, R14, RCX); x86_add_ri(b, R14, 8);      /* end offset of pointer fields */
@@ -1733,11 +1882,12 @@ static void emit_output_terms(NativeEmit *e) {
     static const int one_head[]       = { DATA_PRIM_S, DATA_PRIM_K, DATA_PRIM_B, DATA_PRIM_C, DATA_PRIM_T, DATA_PRIM_R, -1 };
     static const ClosureType two[]    = { CLOS_S2, CLOS_B2, CLOS_C2, CLOS_R2 };
     static const int two_head[]       = { DATA_PRIM_S, DATA_PRIM_B, DATA_PRIM_C, DATA_PRIM_R };
-    u32 pl[7], p1[7], p2[4], pw, pp, pa;
+    u32 pl[7], p1[7], p2[4], pw, pb, pp, pa;
     for (int i = 0; i < 7; i++) { emit_get_entry(b, RAX, leaves[i]); x86_cmp_rr(b, RDX, RAX); pl[i] = emit_jcc(b, CC_E); }
     for (int i = 0; i < 7; i++) { emit_get_entry(b, RAX, one[i]);    x86_cmp_rr(b, RDX, RAX); p1[i] = emit_jcc(b, CC_E); }
     for (int i = 0; i < 4; i++) { emit_get_entry(b, RAX, two[i]);    x86_cmp_rr(b, RDX, RAX); p2[i] = emit_jcc(b, CC_E); }
     emit_get_entry(b, RAX, CLOS_WORD); x86_cmp_rr(b, RDX, RAX); pw = emit_jcc(b, CC_E);
+    emit_get_entry(b, RAX, CLOS_BIG);  x86_cmp_rr(b, RDX, RAX); pb = emit_jcc(b, CC_E);
     emit_get_entry(b, RAX, CLOS_PRIM); x86_cmp_rr(b, RDX, RAX); pp = emit_jcc(b, CC_E);
     emit_get_entry(b, RAX, CLOS_APP);  x86_cmp_rr(b, RDX, RAX); pa = emit_jcc(b, CC_E);
     x86_int3(b);   /* not a normal form */
@@ -1759,6 +1909,32 @@ static void emit_output_terms(NativeEmit *e) {
         emit_jmp_back(b, loop_start);
     } else {
         emit_die(b, qword_of("words ne"), qword_of("ed xbcl\n"), 1);
+    }
+    /* a limb list: 011, XB_BIG's five bits, the 32-bit limb count, then each limb (least significant first) */
+    x86_patch_rel32(b, pb, x86_len(b));
+    if (fmt == OUTPUT_XBCL) {
+        char leaf[16]; int n = 0;
+        leaf[n++] = '0'; leaf[n++] = '1'; leaf[n++] = '1';
+        for (int i = 4; i >= 0; i--) leaf[n++] = ((XB_BIG >> i) & 1) ? '1' : '0';
+        leaf[n] = 0;
+        emit_bits(b, leaf);
+        x86_mov_rm(b, R14, R10, 8);                  /* the limb count (r14 and r12 are free out here) */
+        x86_mov_rr(b, RBX, R14);
+        emit_shl_ri(b, RBX, 32);                     /* emit_top_bits writes the top bits, like the word's 64 */
+        emit_top_bits(b, 32);
+        x86_lea(b, R12, R10, 16);                    /* the limbs themselves */
+        u32 bloop = x86_len(b);
+        x86_cmp_ri(b, R14, 0);
+        u32 bdone = emit_jcc(b, CC_E);
+        x86_mov_rm(b, RBX, R12, 0);
+        x86_add_ri(b, R12, 8);
+        x86_sub_ri(b, R14, 1);
+        emit_top_bits(b, 64);
+        emit_jmp_back(b, bloop);
+        x86_patch_rel32(b, bdone, x86_len(b));
+        emit_jmp_back(b, loop_start);
+    } else {
+        emit_die(b, qword_of("limbs ne"), qword_of("ed xbcl\n"), 1);
     }
     x86_patch_rel32(b, pp, x86_len(b));
     if (fmt == OUTPUT_XBCL) {
@@ -1837,9 +2013,9 @@ void native_emit_runtime(NativeEmit *e) {
     emit_entry_K1(e);
     static const ClosureType values[] = {
         CLOS_B, CLOS_C, CLOS_T, CLOS_R, CLOS_B1, CLOS_B2, CLOS_C1, CLOS_C2, CLOS_T1, CLOS_R1, CLOS_R2,
-        CLOS_WORD, CLOS_PRIM, CLOS_PRIM1
+        CLOS_WORD, CLOS_PRIM, CLOS_PRIM1, CLOS_BIG
     };
-    for (int i = 0; i < 14; i++) emit_entry_value(e, values[i]);
+    for (int i = 0; i < 15; i++) emit_entry_value(e, values[i]);
     /* Thunks and continuations */
     emit_entry_App(e);
     emit_entry_Ind(e);
@@ -2035,10 +2211,15 @@ static u64 build_term_recursive(NativeJIT *jit, SKITerm *term, u8 **hp_ptr) {
             return (u64)((u8*)jit->data + DATA_PRIM_R);
         case TERM_PRIM:
             return (u64)((u8*)jit->data + DATA_PRIM_OPS + 16 * (u64)term->op);
-        case TERM_BIG:
-            /* A limb list has no closure here: it runs on the simple interpreter. main.c refuses one
-               before the JIT is entered, so this is the backstop, not a path. */
-            ski_refuse_limb("the native JIT");
+        case TERM_BIG: {
+            /* Big[n, limbs...] - 2 + n words: the count, then the limbs, as bn.h reads them */
+            u64 *b = (u64*)*hp_ptr;
+            *hp_ptr += 16 + 8 * (u64)term->big->n;
+            b[0] = data[(DATA_ENTRY_TABLE / 8) + CLOS_BIG];
+            b[1] = (u64)term->big->n;
+            for (int i = 0; i < term->big->n; i++) b[2 + i] = term->big->limb[i];
+            return (u64)b;
+        }
 
         case TERM_WORD: {
             /* Word[w] - 2 words */
@@ -2359,7 +2540,7 @@ static u32 calc_term_size(SKITerm *term) {
         case TERM_WORD:
             return 16;
         case TERM_BIG:
-            ski_refuse_limb("the native JIT");   /* the backstop: main.c refuses a limb list first */
+            return 16 + 8 * (u32)term->big->n;   /* the count, then the limbs */
         case TERM_APP:
             return 24 + calc_term_size(term->app.left) + calc_term_size(term->app.right);
     }
@@ -2406,8 +2587,15 @@ static u64 build_term_for_elf(SKITerm *term, u8 *buf, u64 buf_vaddr, u32 *hp,
             return data_vaddr + DATA_PRIM_R;
         case TERM_PRIM:
             return data_vaddr + DATA_PRIM_OPS + 16 * (u64)term->op;
-        case TERM_BIG:
-            ski_refuse_limb("the native JIT");   /* the backstop: main.c refuses a limb list first */
+        case TERM_BIG: {
+            u32 offset = *hp;
+            *hp += 16 + 8 * (u32)term->big->n;
+            u64 *b = (u64*)(buf + offset);
+            b[0] = code_vaddr + entry_offsets[CLOS_BIG];
+            b[1] = (u64)term->big->n;
+            for (int i = 0; i < term->big->n; i++) b[2 + i] = term->big->limb[i];
+            return buf_vaddr + offset;
+        }
 
         case TERM_WORD: {
             u32 offset = *hp;

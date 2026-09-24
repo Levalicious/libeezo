@@ -16,6 +16,7 @@
 
 #include "types.h"
 #include "term.h"
+#include "bcl.h"     /* XB_BIG: the limb list's leaf code, which the emitted output writes */
 #include "x86.h"
 
 /*
@@ -55,6 +56,7 @@ typedef enum {
     CLOS_WORD,      /* Word[w] - a machine word (w is not a pointer) */
     CLOS_PRIM,      /* Prim[op] - a word primitive (one singleton per op; op is not a pointer) */
     CLOS_PRIM1,     /* Prim1[x, op] - the primitive applied to x */
+    CLOS_BIG,       /* Big[n, limbs...] - the limb list (M16b): the count, then the limbs LSB first; size 2 + n */
     CLOS_COUNT
 } ClosureType;
 
@@ -96,6 +98,7 @@ static const int CLOS_SIZES[CLOS_COUNT] = {
     2,  /* WORD: entry + the word */
     2,  /* PRIM: entry + op */
     3,  /* PRIM1: entry + x + op */
+    2,  /* BIG: entry + the limb count (any more; classify computes 2 + n from the count word) */
 };
 
 /* Pointer counts for GC (excludes entry ptr itself) */
@@ -123,6 +126,7 @@ static const int CLOS_PTRS[CLOS_COUNT] = {
     0,  /* WORD */
     0,  /* PRIM */
     1,  /* PRIM1: x only; op is a datum */
+    0,  /* BIG: no pointers (the limbs are data) */
 };
 
 /*
