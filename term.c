@@ -1,3 +1,4 @@
+#include "res.h"
 /*
  * term.c - SKI combinator term implementation
  */
@@ -10,7 +11,7 @@
  */
 
 void pool_init(SKIPool *p, u32 capacity) {
-    p->pool = calloc(capacity, sizeof(SKITerm));
+    p->pool = rcalloc(capacity, sizeof(SKITerm));
     p->capacity = capacity;
     p->next_free = 0;
     p->freelist = NULL;
@@ -103,7 +104,6 @@ SKITerm *ski_t(SKIPool *p) { return leaf(p, TERM_T); }
 SKITerm *ski_r(SKIPool *p) { return leaf(p, TERM_R); }
 SKITerm *ski_word(SKIPool *p, u64 w) { SKITerm *t = leaf(p, TERM_WORD); if (t) t->word = w; return t; }
 SKITerm *ski_prim(SKIPool *p, PrimOp op) { SKITerm *t = leaf(p, TERM_PRIM); if (t) t->op = op; return t; }
-
 int ski_arity(SKITag tag) {
     switch (tag) {
     case TERM_S: case TERM_B: case TERM_C: case TERM_R: return 3;
@@ -413,7 +413,7 @@ static bool reduce_step(SKIPool *p, SKITerm **tp) {
     case TERM_R: r = app2(p, app2(p, ski_ref(y), ski_ref(z)), ski_ref(x)); break;                /* R x y z -> y z x */
     case TERM_WORD: r = app2(p, ski_ref(x), ski_ref(s.head)); break;                             /* #w f -> f #w */
     case TERM_PRIM:
-        if (x->tag != TERM_WORD)                                                                 /* op x y -> x (B y op) */
+        if (x->tag != TERM_WORD)                                                          /* op x y -> x (B y op) */
             r = app2(p, ski_ref(x), app2(p, app2(p, ski_b(p), ski_ref(y)), ski_ref(s.head)));
         else if (y->tag != TERM_WORD)                                                            /* op x y -> y (op x) */
             r = app2(p, ski_ref(y), app2(p, ski_ref(s.head), ski_ref(x)));

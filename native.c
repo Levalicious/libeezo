@@ -1,3 +1,4 @@
+#include "res.h"
 /*
  * native.c - Native code generation for CPS SKI
  *
@@ -748,7 +749,7 @@ static void emit_entry_Norm(NativeEmit *e) {
     emit_dispatch(b, prims, 9, pp);
     emit_dispatch(b, paps, 11, pq);
     x86_int3(b);
-    /* primitive: already normal */
+    /* a primitive: already normal */
     for (int i = 0; i < 9; i++) x86_patch_rel32(b, pp[i], x86_len(b));
     x86_mov_rr(b, RBX, RDX);
     emit_call_cont(b);
@@ -2034,6 +2035,7 @@ static u64 build_term_recursive(NativeJIT *jit, SKITerm *term, u8 **hp_ptr) {
             return (u64)((u8*)jit->data + DATA_PRIM_R);
         case TERM_PRIM:
             return (u64)((u8*)jit->data + DATA_PRIM_OPS + 16 * (u64)term->op);
+
         case TERM_WORD: {
             /* Word[w] - 2 words */
             u64 *w = (u64*)*hp_ptr;
@@ -2060,8 +2062,8 @@ static u64 build_term_recursive(NativeJIT *jit, SKITerm *term, u8 **hp_ptr) {
         }
     }
     
-    fprintf(stderr, "native: term tag %d has no closure yet\n", (int)term->tag);
-    abort();
+    fprintf(stderr, "native: internal: a term of unknown kind\n");
+    exit(1);
 }
 
 /*
@@ -2352,8 +2354,8 @@ static u32 calc_term_size(SKITerm *term) {
         case TERM_APP:
             return 24 + calc_term_size(term->app.left) + calc_term_size(term->app.right);
     }
-    fprintf(stderr, "native: term tag %d has no closure\n", (int)term->tag);
-    abort();
+    fprintf(stderr, "native: internal: a term of unknown kind\n");
+    exit(1);
 }
 
 /*
@@ -2392,6 +2394,7 @@ static u64 build_term_for_elf(SKITerm *term, u8 *buf, u64 buf_vaddr, u32 *hp,
             return data_vaddr + DATA_PRIM_R;
         case TERM_PRIM:
             return data_vaddr + DATA_PRIM_OPS + 16 * (u64)term->op;
+
         case TERM_WORD: {
             u32 offset = *hp;
             *hp += 16;
@@ -2419,8 +2422,8 @@ static u64 build_term_for_elf(SKITerm *term, u8 *buf, u64 buf_vaddr, u32 *hp,
             return buf_vaddr + offset;
         }
     }
-    fprintf(stderr, "native: term tag %d has no closure\n", (int)term->tag);
-    abort();
+    fprintf(stderr, "native: internal: a term of unknown kind\n");
+    exit(1);
 }
 
 /*
@@ -2523,7 +2526,7 @@ void native_emit_elf(NativeEmit *e, u8 **out, u32 *out_size, SKITerm *term, u32 
     u32 total_size = header_size + code_size + data_size;
     
     /* Allocate output buffer */
-    u8 *elf = malloc(total_size);
+    u8 *elf = rmalloc(total_size);
     if (!elf) {
         free(data);
         *out = NULL;

@@ -16,6 +16,7 @@
 
 #include "types.h"
 #include "term.h"
+#include "bcl.h"     /* the XBCL leaf codes, which the emitted output writes */
 #include "x86.h"
 
 /*

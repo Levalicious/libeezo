@@ -28,7 +28,7 @@ typedef enum {
     TERM_T,
     TERM_R,
     TERM_WORD,      /* a u64 */
-    TERM_PRIM,      /* a word primitive, of arity 2 */
+    TERM_PRIM,      /* a primitive, of arity 2 on machine words */
 } SKITag;
 
 /*

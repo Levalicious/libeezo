@@ -16,6 +16,12 @@
 #include "term.h"
 
 /*
+ * The extended-leaf codes of XBCL (five bits, after the 011 tag). The range is five bits wide, so
+ * PRIM_COUNT must stay below 26.
+ */
+enum { XB_I = 0, XB_B, XB_C, XB_T, XB_R, XB_WORD, XB_PRIM0 };
+
+/*
  * BCL bit stream for parsing
  * Wraps a byte array, tracks current bit position
  */
