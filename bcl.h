@@ -16,13 +16,10 @@
 #include "term.h"
 
 /*
- * The extended-leaf codes of XBCL (five bits, after the 011 tag). A limb list follows the primitives:
- * the code, a 32-bit limb count, then the limbs, least significant first. The range is five bits wide,
- * so PRIM_COUNT must stay below 26.
+ * The extended-leaf codes of XBCL (five bits, after the 011 tag). The range is five bits wide, so
+ * PRIM_COUNT must stay below 26.
  */
-enum { XB_I = 0, XB_B, XB_C, XB_T, XB_R, XB_WORD, XB_PRIM0, XB_BIG = XB_PRIM0 + PRIM_COUNT,
-       /* a denoted number follows the limb list: a limb list for the base, then one for the exponent */
-       XB_DEN = XB_BIG + 1 };
+enum { XB_I = 0, XB_B, XB_C, XB_T, XB_R, XB_WORD, XB_PRIM0 };
 
 /*
  * BCL bit stream for parsing

@@ -104,25 +104,11 @@ SKITerm *ski_t(SKIPool *p) { return leaf(p, TERM_T); }
 SKITerm *ski_r(SKIPool *p) { return leaf(p, TERM_R); }
 SKITerm *ski_word(SKIPool *p, u64 w) { SKITerm *t = leaf(p, TERM_WORD); if (t) t->word = w; return t; }
 SKITerm *ski_prim(SKIPool *p, PrimOp op) { SKITerm *t = leaf(p, TERM_PRIM); if (t) t->op = op; return t; }
-SKITerm *ski_big(SKIPool *p, Bn *b) {
-    SKITerm *t = leaf(p, TERM_BIG);
-    if (!t) { bn_free(b); return NULL; }   /* the leaf owns the list from here */
-    t->big = b;
-    return t;
-}
-
-SKITerm *ski_den(SKIPool *p, Bn *base, Bn *exp) {
-    SKITerm *t = leaf(p, TERM_DEN);
-    if (!t) { bn_free(base); bn_free(exp); return NULL; }
-    t->den.base = base; t->den.exp = exp;
-    return t;
-}
-
 int ski_arity(SKITag tag) {
     switch (tag) {
     case TERM_S: case TERM_B: case TERM_C: case TERM_R: return 3;
     case TERM_K: case TERM_T: case TERM_PRIM: return 2;
-    case TERM_I: case TERM_WORD: case TERM_BIG: case TERM_DEN: return 1;
+    case TERM_I: case TERM_WORD: return 1;
     default: return 0;
     }
 }
@@ -130,9 +116,7 @@ int ski_arity(SKITag tag) {
 const char *prim_name(PrimOp op) {
     static const char *names[PRIM_COUNT] = {
         "add", "sub", "mul", "and", "or", "xor", "shl", "shr",
-        "eq", "lt", "addc", "subb", "mull", "divmod",
-        "badd", "bsub", "bmul", "bdivmod", "blt", "beq",
-        "bpow", "bminv"
+        "eq", "lt", "addc", "subb", "mull", "divmod"
     };
     return op < PRIM_COUNT ? names[op] : "?";
 }
@@ -193,7 +177,7 @@ static SKITerm *expand_pure(SKIPool *p, SKITerm *t, PureLeaves *pl) {
         if (!a) { ski_unref(p, l); ski_unref(p, r); }
         return a;
     }
-    default: return NULL;   /* words, limb lists and primitives */
+    default: return NULL;   /* words and primitives */
     }
 }
 
@@ -208,24 +192,6 @@ bool ski_uses_words(SKITerm *t) {
     if (!t) return false;
     if (t->tag == TERM_APP) return ski_uses_words(t->app.left) || ski_uses_words(t->app.right);
     return t->tag == TERM_WORD || t->tag == TERM_PRIM;
-}
-
-bool ski_uses_bigs(SKITerm *t) {
-    if (!t) return false;
-    if (t->tag == TERM_APP) return ski_uses_bigs(t->app.left) || ski_uses_bigs(t->app.right);
-    return t->tag == TERM_BIG || (t->tag == TERM_PRIM && prim_is_limb(t->op));
-}
-
-void ski_refuse_limb(const char *who) {
-    fprintf(stderr, "eezo: %s has no limb primitives yet: a limb list is the C list of limbs (bn.h),\n"
-                    "      and it evaluates itself on the simple interpreter, so run this program with -s\n", who);
-    exit(1);
-}
-
-void ski_refuse_den(const char *who) {
-    fprintf(stderr, "eezo: %s has no denoted numbers yet: a power no limb list fits is a value the\n"
-                    "      simple interpreter names, so run this program with -s\n", who);
-    exit(1);
 }
 
 bool ski_uses_extended(SKITerm *t) {
@@ -249,10 +215,6 @@ void ski_unref(SKIPool *p, SKITerm *t) {
         if (t->tag == TERM_APP) {
             ski_unref(p, t->app.left);
             ski_unref(p, t->app.right);
-        } else if (t->tag == TERM_BIG) {
-            bn_free(t->big);
-        } else if (t->tag == TERM_DEN) {
-            bn_free(t->den.base); bn_free(t->den.exp);
         }
         pool_release(p, t);
     }
@@ -275,8 +237,6 @@ SKITerm *ski_copy(SKIPool *p, SKITerm *t) {
     case TERM_R: return ski_r(p);
     case TERM_WORD: return ski_word(p, t->word);
     case TERM_PRIM: return ski_prim(p, t->op);
-    case TERM_BIG: return ski_big(p, bn_copy(t->big));
-    case TERM_DEN: return ski_den(p, bn_copy(t->den.base), bn_copy(t->den.exp));
     case TERM_APP: {
         SKITerm *left = ski_copy(p, t->app.left);
         if (!left) return NULL;
@@ -435,78 +395,6 @@ SKITerm *prim_apply(SKIPool *p, PrimOp op, u64 a, u64 b) {
     }
 }
 
-/* A limb operand is a limb list or a machine word: the word is its one limb, and 2^64 - 1 is
- * literally a machine word. Its list: the leaf's own, or the word's single limb in tmp. */
-static bool is_limb_operand(SKITerm *t) { return t->tag == TERM_BIG || t->tag == TERM_WORD || t->tag == TERM_DEN; }
-static const Bn *limb_of(SKITerm *t, Bn *tmp) {
-    if (t->tag == TERM_BIG) return t->big;
-    tmp->limb = t->word ? &t->word : NULL;   /* zero is the empty list: no limb at all */
-    tmp->n = t->word ? 1 : 0;
-    return tmp;
-}
-
-/* a ^ e: materialized when a limb list can hold it, denoted when none can (M17) */
-static SKITerm *den_make(SKIPool *p, Bn *base, Bn *exp) {
-    if (!bn_fits_pow(base, exp)) return ski_den(p, base, exp);
-    SKITerm *t = ski_big(p, bn_pow(base, exp));
-    bn_free(base); bn_free(exp);
-    return t;
-}
-/* the value itself, for a denoted number that has one: NULL when no limb list holds it */
-static const Bn *den_value(SKITerm *t, Bn **owned, Bn *tmp) {
-    if (t->tag != TERM_DEN) return limb_of(t, tmp);
-    if (!bn_fits_pow(t->den.base, t->den.exp)) return NULL;
-    *owned = bn_pow(t->den.base, t->den.exp);
-    return *owned;
-}
-/* a number the machine can only denote reached an operation that wanted it held */
-void ski_refuse_den_op(PrimOp op) {
-    fprintf(stderr, "eezo: %s needs a number this machine can hold, and its argument is only denoted: "
-                    "the value is a power no limb list fits (M17)\n", prim_name(op));
-    exit(1);
-}
-
-/* The C list evaluating itself: one pass over the limbs, not a fold unfolding */
-SKITerm *prim_big_apply(SKIPool *p, PrimOp op, SKITerm *x, SKITerm *y) {
-    Bn tx, ty;
-    const Bn *a = limb_of(x, &tx), *b = limb_of(y, &ty);
-    /* A denoted number is a Nat the machine names instead of holding. The limb primitives act on it by
-       the laws stdlib/tt proves (pow_add, pow_mul), or by building it when a limb list can hold it, and
-       when neither is true they refuse by name - never a silent answer. */
-    if (x->tag == TERM_DEN || y->tag == TERM_DEN) {
-        if (op == PRIM_BPOW && x->tag == TERM_DEN && y->tag != TERM_DEN)
-            return den_make(p, bn_copy(x->den.base), bn_mul(x->den.exp, limb_of(y, &ty)));   /* pow_mul */
-        if (op == PRIM_BMUL && x->tag == TERM_DEN && y->tag == TERM_DEN && bn_cmp(x->den.base, y->den.base) == 0)
-            return den_make(p, bn_copy(x->den.base), bn_add(x->den.exp, y->den.exp));        /* pow_add */
-        /* everything else wants the number itself: build the operands, or say why not */
-        Bn *ox = NULL, *oy = NULL;
-        const Bn *vx = den_value(x, &ox, &tx), *vy = den_value(y, &oy, &ty);
-        if (!vx || !vy) { bn_free(ox); bn_free(oy); ski_refuse_den_op(op); }
-        SKITerm *mx = ski_big(p, bn_copy(vx)), *my = ski_big(p, bn_copy(vy));
-        bn_free(ox); bn_free(oy);
-        SKITerm *r = (mx && my) ? prim_big_apply(p, op, mx, my) : NULL;
-        ski_unref(p, mx); ski_unref(p, my);
-        return r;
-    }
-    switch (op) {
-    case PRIM_BADD: return ski_big(p, bn_add(a, b));
-    case PRIM_BSUB: return ski_big(p, bn_monus(a, b));
-    case PRIM_BMUL: return ski_big(p, bn_mul(a, b));
-    case PRIM_BDIVMOD: {
-        Bn *q, *r;
-        bn_divmod(a, b, &q, &r);
-        SKITerm *qt = ski_big(p, q), *rt = ski_big(p, r);
-        if (!qt || !rt) { ski_unref(p, qt); ski_unref(p, rt); return NULL; }
-        return mk_pair(p, qt, rt);
-    }
-    case PRIM_BLT: return mk_bool(p, bn_cmp(a, b) < 0);
-    case PRIM_BEQ: return mk_bool(p, bn_cmp(a, b) == 0);
-    case PRIM_BPOW: return den_make(p, bn_copy(a), bn_copy(b));   /* built, or denoted when it cannot fit */
-    case PRIM_BMINV: return ski_big(p, bn_minv(a, b));   /* minv x y = x ^ (y - 2) mod y, never the power */
-    default: return NULL;
-    }
-}
-
 /* Perform one reduction step at *tp. Returns true if reduced. */
 static bool reduce_step(SKIPool *p, SKITerm **tp) {
     SKITerm *t = *tp;
@@ -524,22 +412,8 @@ static bool reduce_step(SKIPool *p, SKITerm **tp) {
     case TERM_T: r = app2(p, ski_ref(y), ski_ref(x)); break;                                     /* T x y -> y x */
     case TERM_R: r = app2(p, app2(p, ski_ref(y), ski_ref(z)), ski_ref(x)); break;                /* R x y z -> y z x */
     case TERM_WORD: r = app2(p, ski_ref(x), ski_ref(s.head)); break;                             /* #w f -> f #w */
-    case TERM_BIG: r = app2(p, ski_ref(x), ski_ref(s.head)); break;                               /* b f -> f b */
-    case TERM_DEN: r = app2(p, ski_ref(x), ski_ref(s.head)); break;                               /* d f -> f d */
     case TERM_PRIM:
-        if (prim_is_limb(s.head->op)) {
-            if (!is_limb_operand(x))                                                             /* op x y -> x (B y op) */
-                r = app2(p, ski_ref(x), app2(p, app2(p, ski_b(p), ski_ref(y)), ski_ref(s.head)));
-            else if (!is_limb_operand(y))                                                        /* op x y -> y (op x) */
-                r = app2(p, ski_ref(y), app2(p, ski_ref(s.head), ski_ref(x)));
-            else
-                r = prim_big_apply(p, s.head->op, x, y);
-        } else if (x->tag == TERM_BIG || y->tag == TERM_BIG) {   /* a word primitive on a limb list */
-            fprintf(stderr, "eezo: the word primitive %s takes machine words, not a limb list: "
-                            "the limb primitives (badd bsub bmul bdivmod blt beq) take limb lists\n",
-                    prim_name(s.head->op));
-            exit(1);
-        } else if (x->tag != TERM_WORD)                                                          /* op x y -> x (B y op) */
+        if (x->tag != TERM_WORD)                                                          /* op x y -> x (B y op) */
             r = app2(p, ski_ref(x), app2(p, app2(p, ski_b(p), ski_ref(y)), ski_ref(s.head)));
         else if (y->tag != TERM_WORD)                                                            /* op x y -> y (op x) */
             r = app2(p, ski_ref(y), app2(p, ski_ref(s.head), ski_ref(x)));
@@ -633,9 +507,6 @@ void ski_fprint(FILE *f, SKITerm *t) {
         case TERM_R: fprintf(f, "R"); break;
         case TERM_WORD: fprintf(f, "#%llu", (unsigned long long)t->word); break;
         case TERM_PRIM: fprintf(f, "#%s", prim_name(t->op)); break;
-        case TERM_BIG: { char *d = bn_to_dec(t->big); fprintf(f, "#%sB", d); free(d); break; }
-        case TERM_DEN: { char *b = bn_to_dec(t->den.base), *e = bn_to_dec(t->den.exp);
-                         fprintf(f, "#%s^%s", b, e); free(b); free(e); break; }
         case TERM_APP:
             fprintf(f, "(");
             ski_fprint(f, t->app.left);
