@@ -56,6 +56,9 @@ typedef enum {
     CLOS_WORD,      /* Word[w] - a machine word (w is not a pointer) */
     CLOS_PRIM,      /* Prim[op] - a word primitive (one singleton per op; op is not a pointer) */
     CLOS_PRIM1,     /* Prim1[x, op] - the primitive applied to x */
+    CLOS_MOT,       /* MoT - monadic I/O: receives the program's 4-tuple, asks for its tag */
+    CLOS_MONUMH,    /* MoNumH[v, what] - receives a numeral, applies it to the markers K and S */
+    CLOS_MONUMN,    /* MoNumN[v, what, count] - unfolds the K1 spine; on S acts on count as `what` says */
     CLOS_COUNT
 } ClosureType;
 
@@ -97,6 +100,9 @@ static const int CLOS_SIZES[CLOS_COUNT] = {
     2,  /* WORD: entry + the word */
     2,  /* PRIM: entry + op */
     3,  /* PRIM1: entry + x + op */
+    1,  /* MOT */
+    3,  /* MONUMH: entry + v + what (a small integer the collector leaves alone) */
+    4,  /* MONUMN: entry + v + what + count */
 };
 
 /* Pointer counts for GC (excludes entry ptr itself) */
@@ -124,6 +130,9 @@ static const int CLOS_PTRS[CLOS_COUNT] = {
     0,  /* WORD */
     0,  /* PRIM */
     1,  /* PRIM1: x only; op is a datum */
+    0,  /* MOT */
+    2,  /* MONUMH (what is outside every semispace, so copy_closure returns it unchanged, as ION's count) */
+    3,  /* MONUMN */
 };
 
 /*
@@ -159,7 +168,7 @@ static const int CLOS_PTRS[CLOS_COUNT] = {
 #define DATA_FROM_END       168
 #define DATA_STATIC_BEGIN   176     /* void*: static closure area (ELF: the embedded term) - scanned as roots */
 #define DATA_STATIC_END     184
-#define DATA_IO_MODE        192     /* u64: 1 = stream I/O mode (Lazy-K), 0 = term output */
+#define DATA_IO_MODE        192     /* u64: 1 = stream I/O mode (Lazy-K), 2 = monadic I/O, 0 = term output */
 #define DATA_STATIC2_BEGIN  200     /* void*: second static root area: the input stream (io mode) */
 #define DATA_STATIC2_END    208
 #define DATA_IO_BUF         216     /* void*: raw stdin bytes (io mode) */
@@ -178,7 +187,10 @@ static const int CLOS_PTRS[CLOS_COUNT] = {
 #define DATA_PRIM_T         (DATA_PRIM_C + 8)
 #define DATA_PRIM_R         (DATA_PRIM_T + 8)
 #define DATA_PRIM_OPS       (DATA_PRIM_R + 8)               /* PRIM_COUNT singletons [entry_Prim, op], 16 bytes each */
-#define DATA_SECTION_SIZE   (DATA_PRIM_OPS + 16 * PRIM_COUNT)
+#define DATA_MOT            (DATA_PRIM_OPS + 16 * PRIM_COUNT)   /* MoT continuation singleton (1 word) */
+#define DATA_MO_SEL         (DATA_MOT + 8)                      /* void*[4]: the 4-tuple's selectors, built at start (monadic I/O) */
+#define DATA_MO_INBYTE      (DATA_MO_SEL + 32)                  /* u64: the byte getc reads (zeroed first) */
+#define DATA_SECTION_SIZE   (DATA_MO_INBYTE + 8)
 
 /*
  * Register convention (during CPS execution):
