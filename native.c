@@ -26,6 +26,7 @@
 #define SYS_munmap  11
 #define SYS_mremap  25
 #define SYS_exit    60
+#define SYS_rt_sigaction 13
 
 /* mmap flags */
 #define MMAP_PROT_RW    (0x1 | 0x2)  /* PROT_READ | PROT_WRITE */
@@ -1450,6 +1451,19 @@ static void emit_io_start(NativeEmit *e) {
 static void emit_start(NativeEmit *e) {
     X86Buf *b = &e->code;
     e->start_offset = x86_len(b);
+    /* rt_sigaction(SIGPIPE, &{SIG_DFL}, NULL, 8): the classic pipe behaviour whatever the parent left us. A program
+       streaming to a reader that has gone away dies of SIGPIPE (exit 141); with an inherited SIG_IGN (a CI runner's
+       shell) it looped on failed writes instead (the io suite's 'ones', 2026-09-28). The 32 zero bytes pushed are the
+       kernel's struct sigaction: handler SIG_DFL, flags 0, restorer 0, mask empty. */
+    x86_mov_ri(b, RAX, 0);
+    for (int i = 0; i < 4; i++) x86_push(b, RAX);
+    x86_mov_ri(b, RAX, SYS_rt_sigaction);
+    x86_mov_ri(b, RDI, 13);                     /* SIGPIPE */
+    x86_mov_rr(b, RSI, RSP);
+    x86_mov_ri(b, RDX, 0);
+    x86_mov_ri(b, R10, 8);                      /* sizeof(sigset_t) as the kernel wants it */
+    emit_syscall(b);
+    for (int i = 0; i < 4; i++) x86_pop(b, RAX);
     
     /*
      * Entry point:
