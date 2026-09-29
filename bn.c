@@ -6,14 +6,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-/* The limb lists come from the resource policy (res.h): a failed allocation is never a typing
-   judgement. BN_TEST builds this file as its own program, on plain calloc. */
-#ifdef BN_TEST
-static void *bn_bytes(size_t n) { void *p = calloc(1, n ? n : 1); if (!p) { fprintf(stderr, "out of memory\n"); exit(1); } return p; }
-#else
-#include "res.h"
+/* The limb lists come from the memory layer (mem.h): a failed allocation is never a typing judgement */
+#include "mem.h"
 static void *bn_bytes(size_t n) { return rcalloc(1, n); }
-#endif
 
 typedef unsigned __int128 u128;
 typedef __int128 i128;

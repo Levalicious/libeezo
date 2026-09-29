@@ -47,22 +47,19 @@ bool bcl_stream_eof(BclStream *s);
 u64 bcl_stream_pos(BclStream *s);
 
 /*
- * BCL bit buffer for emission
+ * The bit buffer every emitter writes into (BCL, XBCL, Jot, Jomplement): it grows (a Stack of the memory layer), so
+ * nothing sizes it first and no length is bounded by a 32-bit width. Bits are packed most significant first.
  */
 typedef struct {
-    u8 *data;
-    u64 capacity;   /* capacity in bits */
-    u64 len;        /* current length in bits */
+    Stack bytes;
+    u64 len;        /* length in bits */
 } BclBuffer;
 
-/* Initialize buffer */
-void bcl_buffer_init(BclBuffer *b, u8 *data, u64 capacity_bits);
-
-/* Write a bit, returns false if full */
-bool bcl_buffer_write(BclBuffer *b, int bit);
-
-/* Get length in bits */
-u64 bcl_buffer_len(BclBuffer *b);
+void bcl_buffer_init(BclBuffer *b);
+void bcl_buffer_write(BclBuffer *b, int bit);
+u64 bcl_buffer_len(const BclBuffer *b);
+const u8 *bcl_buffer_data(const BclBuffer *b);   /* ceil(len / 8) bytes; the last byte's unused bits are 0 */
+void bcl_buffer_drop(BclBuffer *b);
 
 /*
  * Parsing: BCL bits → SKITerm
@@ -70,7 +67,8 @@ u64 bcl_buffer_len(BclBuffer *b);
 SKITerm *bcl_parse(SKIPool *p, BclStream *s);
 
 /*
- * Emission: SKITerm → BCL bits
+ * Emission: SKITerm → BCL bits, appended to b. False (and b's contents unspecified) when the term has a word or a
+ * primitive, which pure BCL cannot spell.
  */
 bool bcl_emit(SKITerm *t, BclBuffer *b);
 

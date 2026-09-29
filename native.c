@@ -1,4 +1,4 @@
-#include "res.h"
+#include "mem.h"
 /*
  * native.c - Native code generation for CPS SKI
  *
@@ -2197,43 +2197,31 @@ u64 native_max_space(u32 heap_size) {
 }
 
 NativeJIT *native_jit_prepare(NativeEmit *e, u32 heap_size) {
-    NativeJIT *jit = calloc(1, sizeof(NativeJIT));
-    if (!jit) return NULL;
+    /* The JIT's own memory goes through the memory layer (mem.h): its failure is the layer's resource abort. The heaps
+       mapped here are the running program's, grown and collected by the emitted code itself. */
+    NativeJIT *jit = rcalloc(1, sizeof(NativeJIT));
     
     u32 code_size = x86_len(&e->code);
     
     /* Allocate executable memory for code */
+    mem_account(code_size);
     jit->code = mmap(NULL, code_size, PROT_READ | PROT_WRITE | PROT_EXEC,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (jit->code == MAP_FAILED) {
-        free(jit);
-        return NULL;
-    }
+    if (jit->code == MAP_FAILED) resource_die("out of memory (%u bytes of code)", code_size);
     memcpy(jit->code, e->code.buf, code_size);
     jit->code_size = code_size;
     
     /* Allocate data section */
-    jit->data = calloc(1, DATA_SECTION_SIZE);
-    if (!jit->data) {
-        munmap(jit->code, code_size);
-        free(jit);
-        return NULL;
-    }
+    jit->data = rcalloc(1, DATA_SECTION_SIZE);
     
     /* Allocate heaps */
     jit->heap_size = heap_size;
+    mem_account((size_t)heap_size * 2);
     jit->heap0 = mmap(NULL, heap_size, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     jit->heap1 = mmap(NULL, heap_size, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (jit->heap0 == MAP_FAILED || jit->heap1 == MAP_FAILED) {
-        if (jit->heap0 != MAP_FAILED) munmap(jit->heap0, heap_size);
-        if (jit->heap1 != MAP_FAILED) munmap(jit->heap1, heap_size);
-        free(jit->data);
-        munmap(jit->code, code_size);
-        free(jit);
-        return NULL;
-    }
+    if (jit->heap0 == MAP_FAILED || jit->heap1 == MAP_FAILED) resource_die("out of memory (two heaps of %u bytes)", heap_size);
     
     /* Initialize data section */
     u64 *data = (u64*)jit->data;
@@ -2762,12 +2750,7 @@ void native_emit_elf(NativeEmit *e, u8 **out, u32 *out_size, SKITerm *term, u32 
     /* Align to 8 bytes */
     data_size = (data_size + 7) & ~7;
     
-    u8 *data = calloc(1, data_size);
-    if (!data) {
-        *out = NULL;
-        *out_size = 0;
-        return;
-    }
+    u8 *data = rcalloc(1, data_size);
     
     u64 code_vaddr = base_addr + header_size;
     u64 data_vaddr = code_vaddr + code_size;
@@ -2818,12 +2801,6 @@ void native_emit_elf(NativeEmit *e, u8 **out, u32 *out_size, SKITerm *term, u32 
     
     /* Allocate output buffer */
     u8 *elf = rmalloc(total_size);
-    if (!elf) {
-        free(data);
-        *out = NULL;
-        *out_size = 0;
-        return;
-    }
     
     /* Fill ELF header */
     Elf64_Ehdr *ehdr = (Elf64_Ehdr*)elf;

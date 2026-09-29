@@ -1,4 +1,3 @@
-#include "res.h"
 /*
  * jomplement.c - Jomplement and Jot parsing and emission
  *
@@ -20,30 +19,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* Bit buffer for emission */
-typedef struct {
-    u8 *data;
-    u32 capacity;  /* in bits */
-    u32 len;       /* current length in bits */
-} JotBuffer;
-
-static void jot_buf_init(JotBuffer *b, u8 *data, u32 capacity_bits) {
-    b->data = data;
-    b->capacity = capacity_bits;
-    b->len = 0;
-    if (data && capacity_bits > 0) {
-        memset(data, 0, (capacity_bits + 7) / 8);
-    }
-}
-
-static bool jot_buf_write(JotBuffer *b, int bit) {
-    if (b->len >= b->capacity) return false;
-    if (bit) {
-        b->data[b->len / 8] |= (1 << (7 - (b->len % 8)));
-    }
-    b->len++;
-    return true;
-}
+#include "mem.h"
 
 /*
  * ===========================================================================
@@ -55,17 +31,15 @@ static bool jot_buf_write(JotBuffer *b, int bit) {
  *   {S}  = 11111000
  *   {AB} = 1{A}{B}
  *   {I}  = (empty, or 1{S}{K}{K} for explicit SKK)
+ * Written into the shared growable bit buffer (bcl.h).
  */
 
-/* Write a bit pattern from a string (leftmost char = first bit written) */
-static bool jot_buf_write_str(JotBuffer *buf, const char *pattern) {
-    for (const char *p = pattern; *p; p++) {
-        if (!jot_buf_write(buf, *p == '1' ? 1 : 0)) return false;
-    }
-    return true;
+static void jot_write_str(BclBuffer *buf, const char *pattern) {
+    for (const char *p = pattern; *p; p++) bcl_buffer_write(buf, *p == '1');
 }
 
-/* A leaf's pure S K spelling (ski_expansion) in Jot: '1' application, S = 11111000, K = 11100, other letters expand in turn */
+/* A leaf's pure S K spelling (ski_expansion) in Jot: '1' application, S = 11111000, K = 11100, other letters expand in
+   turn (recursion only through the constant expansion strings) */
 static u64 jot_expansion_size(const char *e) {
     u64 n = 0;
     for (; *e; e++) {
@@ -82,12 +56,12 @@ static u64 jot_expansion_size(const char *e) {
     return n;
 }
 
-static bool jot_emit_expansion(JotBuffer *buf, const char *e) {
+static bool jot_emit_expansion(BclBuffer *buf, const char *e) {
     for (; *e; e++) {
         switch (*e) {
-            case '1': if (!jot_buf_write(buf, 1)) return false; break;
-            case 'S': if (!jot_buf_write_str(buf, "11111000")) return false; break;
-            case 'K': if (!jot_buf_write_str(buf, "11100")) return false; break;
+            case '1': bcl_buffer_write(buf, 1); break;
+            case 'S': jot_write_str(buf, "11111000"); break;
+            case 'K': jot_write_str(buf, "11100"); break;
             case 'I': if (!jot_emit_expansion(buf, ski_expansion(TERM_I))) return false; break;
             case 'B': if (!jot_emit_expansion(buf, ski_expansion(TERM_B))) return false; break;
             case 'C': if (!jot_emit_expansion(buf, ski_expansion(TERM_C))) return false; break;
@@ -97,39 +71,29 @@ static bool jot_emit_expansion(JotBuffer *buf, const char *e) {
     return true;
 }
 
-/* Calculate size in bits for SKI → Jot encoding */
+/* {AB} = 1{A}{B}: a prefix-code walk on a heap stack, as bcl.c's */
+static Stack jot_st = { NULL, 0, 0, sizeof(SKITerm *) };
+static bool emit_ski_to_jot(SKITerm *t, BclBuffer *buf) {
+    if (!t) return false;
+    size_t base = jot_st.n;
+    STACK_PUSH(&jot_st, SKITerm *, t);
+    while (jot_st.n > base) {
+        SKITerm *x = STACK_POP(&jot_st, SKITerm *);
+        if (x->tag == TERM_APP) { bcl_buffer_write(buf, 1); STACK_PUSH(&jot_st, SKITerm *, x->app.right); STACK_PUSH(&jot_st, SKITerm *, x->app.left); continue; }
+        if (x->tag == TERM_WORD || x->tag == TERM_PRIM || !jot_emit_expansion(buf, ski_expansion(x->tag))) { jot_st.n = base; return false; }   /* no pure spelling */
+    }
+    return true;
+}
 static u64 ski_jot_size(SKITerm *t) {
     if (!t) return 0;
-    
-    switch (t->tag) {
-        case TERM_APP:
-            /* {AB} = 1{A}{B} */
-            return 1 + ski_jot_size(t->app.left) + ski_jot_size(t->app.right);
-        case TERM_WORD:
-        case TERM_PRIM:
-            return 0;
-        default:
-            return jot_expansion_size(ski_expansion(t->tag));
+    size_t base = jot_st.n; u64 n = 0;
+    STACK_PUSH(&jot_st, SKITerm *, t);
+    while (jot_st.n > base) {
+        SKITerm *x = STACK_POP(&jot_st, SKITerm *);
+        if (x->tag == TERM_APP) { n += 1; STACK_PUSH(&jot_st, SKITerm *, x->app.right); STACK_PUSH(&jot_st, SKITerm *, x->app.left); continue; }
+        if (x->tag != TERM_WORD && x->tag != TERM_PRIM) n += jot_expansion_size(ski_expansion(x->tag));
     }
-}
-
-/* Emit SKI term to Jot */
-static bool emit_ski_to_jot(SKITerm *t, JotBuffer *buf) {
-    if (!t) return false;
-    
-    switch (t->tag) {
-        case TERM_APP:
-            /* {AB} = 1{A}{B} */
-            if (!jot_buf_write(buf, 1)) return false;
-            if (!emit_ski_to_jot(t->app.left, buf)) return false;
-            if (!emit_ski_to_jot(t->app.right, buf)) return false;
-            return true;
-        case TERM_WORD:
-        case TERM_PRIM:
-            return false;   /* no pure spelling */
-        default:
-            return jot_emit_expansion(buf, ski_expansion(t->tag));
-    }
+    return n;
 }
 
 /*
@@ -148,141 +112,21 @@ static bool emit_ski_to_jot(SKITerm *t, JotBuffer *buf) {
  * Stream is read left-to-right, but we need RTL semantics.
  * So we buffer all bits first, then process from end to start.
  */
-SKITerm *jomplement_parse(SKIPool *p, BclStream *s) {
-    /* Buffer all bits */
+/* The bits, in the order received (bit 0 is the rightmost of the program): each wraps the term so far. ones is the
+   bit whose rule is [W1] -> S(K[W]) (Jot: 1; Jomplement: 0); the other is [W] -> ([W]S)K. A truncated stream is NULL. */
+static SKITerm *jot_like_parse(SKIPool *p, BclStream *s, int ones) {
     u64 nbits = s->len - s->pos;
-    if (nbits == 0) return ski_i(p);
-    
-    u8 *bits = rmalloc((nbits + 7) / 8);
-    if (!bits) return NULL;
-    
-    for (u64 i = 0; i < nbits; i++) {
-        int b = bcl_stream_read(s);
-        if (b < 0) { free(bits); return NULL; }
-        u64 byte_idx = i / 8;
-        int bit_idx = 7 - (i % 8);
-        if (bit_idx == 7) bits[byte_idx] = 0;
-        if (b) bits[byte_idx] |= (1 << bit_idx);
-    }
-    
     SKITerm *result = ski_i(p);
-    if (!result) { free(bits); return NULL; }
-    
-    /* Process in order received: bit 0 is rightmost */
     for (u64 i = 0; i < nbits; i++) {
-        u64 byte_idx = i / 8;
-        int bit_idx = 7 - (i % 8);
-        u32 bit = (bits[byte_idx] >> bit_idx) & 1;
-        
-        if (bit == 1) {
-            /* [W1] → ([W]S)K */
-            SKITerm *sk = ski_s(p);
-            SKITerm *k = ski_k(p);
-            if (!sk || !k) goto fail;
-            
-            SKITerm *app1 = ski_app(p, result, sk);
-            if (!app1) { ski_unref(p, sk); ski_unref(p, k); goto fail; }
-            
-            SKITerm *app2 = ski_app(p, app1, k);
-            if (!app2) { ski_unref(p, app1); ski_unref(p, k); goto fail; }
-            
-            result = app2;
-        } else {
-            /* [W0] → S(K[W]) */
-            SKITerm *sk = ski_s(p);
-            SKITerm *k = ski_k(p);
-            if (!sk || !k) goto fail;
-            
-            SKITerm *kw = ski_app(p, k, result);
-            if (!kw) { ski_unref(p, sk); ski_unref(p, k); goto fail; }
-            
-            SKITerm *skw = ski_app(p, sk, kw);
-            if (!skw) { ski_unref(p, sk); ski_unref(p, kw); goto fail; }
-            
-            result = skw;
-        }
+        int bit = bcl_stream_read(s);
+        if (bit < 0) { ski_unref(p, result); return NULL; }
+        if (bit == ones) result = ski_app(p, ski_s(p), ski_app(p, ski_k(p), result));   /* S(K[W]) */
+        else result = ski_app(p, ski_app(p, result, ski_s(p)), ski_k(p));             /* ([W]S)K */
     }
-    
-    free(bits);
     return result;
-    
-fail:
-    free(bits);
-    ski_unref(p, result);
-    return NULL;
 }
-
-/*
- * Jot parsing (RIGHT-TO-LEFT):
- *   [ε] → I
- *   [W0] → ([W]S)K
- *   [W1] → S(K[W])
- *
- * Stream-based version for arbitrary length.
- */
-SKITerm *jot_parse(SKIPool *p, BclStream *s) {
-    /* Buffer all bits */
-    u64 nbits = s->len - s->pos;
-    if (nbits == 0) return ski_i(p);
-    
-    u8 *bits = rmalloc((nbits + 7) / 8);
-    if (!bits) return NULL;
-    
-    for (u64 i = 0; i < nbits; i++) {
-        int b = bcl_stream_read(s);
-        if (b < 0) { free(bits); return NULL; }
-        u64 byte_idx = i / 8;
-        int bit_idx = 7 - (i % 8);
-        if (bit_idx == 7) bits[byte_idx] = 0;
-        if (b) bits[byte_idx] |= (1 << bit_idx);
-    }
-    
-    SKITerm *result = ski_i(p);
-    if (!result) { free(bits); return NULL; }
-    
-    /* Process in order received: bit 0 is rightmost */
-    for (u64 i = 0; i < nbits; i++) {
-        u64 byte_idx = i / 8;
-        int bit_idx = 7 - (i % 8);
-        u32 bit = (bits[byte_idx] >> bit_idx) & 1;
-        
-        if (bit == 0) {
-            /* [W0] → ([W]S)K */
-            SKITerm *sk = ski_s(p);
-            SKITerm *k = ski_k(p);
-            if (!sk || !k) goto fail;
-            
-            SKITerm *app1 = ski_app(p, result, sk);
-            if (!app1) { ski_unref(p, sk); ski_unref(p, k); goto fail; }
-            
-            SKITerm *app2 = ski_app(p, app1, k);
-            if (!app2) { ski_unref(p, app1); ski_unref(p, k); goto fail; }
-            
-            result = app2;
-        } else {
-            /* [W1] → S(K[W]) */
-            SKITerm *sk = ski_s(p);
-            SKITerm *k = ski_k(p);
-            if (!sk || !k) goto fail;
-            
-            SKITerm *kw = ski_app(p, k, result);
-            if (!kw) { ski_unref(p, sk); ski_unref(p, k); goto fail; }
-            
-            SKITerm *skw = ski_app(p, sk, kw);
-            if (!skw) { ski_unref(p, sk); ski_unref(p, kw); goto fail; }
-            
-            result = skw;
-        }
-    }
-    
-    free(bits);
-    return result;
-    
-fail:
-    free(bits);
-    ski_unref(p, result);
-    return NULL;
-}
+SKITerm *jomplement_parse(SKIPool *p, BclStream *s) { return jot_like_parse(p, s, 0); }
+SKITerm *jot_parse(SKIPool *p, BclStream *s) { return jot_like_parse(p, s, 1); }
 
 /*
  * ===========================================================================
@@ -298,39 +142,17 @@ u64 jot_size(SKITerm *t) {
 }
 
 /*
- * Emit SKI term to Jot bitstring (direct encoding, no Iota intermediate)
+ * Emit SKI term to Jot bits, appended to b (direct encoding, no Iota intermediate). False when the term has a word or
+ * a primitive, which Jot cannot spell.
  */
-i32 jot_emit(SKITerm *t, u8 *buf, u32 buf_size) {
-    if (!t) return -1;
-    
-    JotBuffer jb;
-    jot_buf_init(&jb, buf, buf_size * 8);
-    
-    bool ok = emit_ski_to_jot(t, &jb);
-    
-    if (!ok) return -1;
-    return (i32)jb.len;
-}
+bool jot_emit(SKITerm *t, BclBuffer *b) { return emit_ski_to_jot(t, b); }
 
 /*
- * Emit SKI term to Jomplement bitstring (bitwise NOT of Jot)
+ * Emit SKI term to Jomplement bits (the bitwise NOT of Jot), appended to b
  */
-i32 jomplement_emit(SKITerm *t, u8 *buf, u32 buf_size) {
-    i32 bits = jot_emit(t, buf, buf_size);
-    if (bits < 0) return bits;
-    
-    /* Flip all bits */
-    u32 full_bytes = bits / 8;
-    for (u32 i = 0; i < full_bytes; i++) {
-        buf[i] = ~buf[i];
-    }
-    
-    /* Flip partial byte bits */
-    u32 remaining = bits % 8;
-    if (remaining > 0) {
-        u8 mask = (0xFF << (8 - remaining)) & 0xFF;
-        buf[full_bytes] = (~buf[full_bytes]) & mask;
-    }
-    
-    return bits;
+bool jomplement_emit(SKITerm *t, BclBuffer *b) {
+    u64 from = bcl_buffer_len(b);
+    if (!jot_emit(t, b)) return false;
+    for (u64 i = from; i < b->len; i++) STACK_AT(&b->bytes, u8, i / 8) ^= (u8)(1 << (7 - i % 8));
+    return true;
 }

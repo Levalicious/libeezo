@@ -39,13 +39,12 @@ SKITerm *jot_parse(SKIPool *p, BclStream *s);
  * Barker transform: K=ι(ι(ιι)), S=ι(ι(ι(ιι))), I=SKK, App preserves structure
  * Iota→Jot: ι="0", App(X,Y)="1"+jot(X)+jot(Y) (tree encoding)
  */
-i32 jot_emit(SKITerm *t, u8 *buf, u32 buf_size);
+bool jot_emit(SKITerm *t, BclBuffer *b);   /* appended to b; false for words and primitives */
 
 /*
- * Emit SKI term to Jomplement bitstring (bitwise NOT of Jot)
- * Same interface as jot_emit
+ * Emit SKI term to Jomplement bitstring (bitwise NOT of Jot), appended to b; as jot_emit
  */
-i32 jomplement_emit(SKITerm *t, u8 *buf, u32 buf_size);
+bool jomplement_emit(SKITerm *t, BclBuffer *b);
 
 /*
  * Size calculation for Jot encoding
