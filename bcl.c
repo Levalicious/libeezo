@@ -2,7 +2,7 @@
  * bcl.c - Binary Combinatory Logic implementation
  */
 #include "bcl.h"
-#include "res.h"
+#include "mem.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -44,28 +44,15 @@ u64 bcl_stream_pos(BclStream *s) {
  * Bit buffer operations
  */
 
-void bcl_buffer_init(BclBuffer *b, u8 *data, u64 capacity_bits) {
-    b->data = data;
-    b->capacity = capacity_bits;
-    b->len = 0;
-    /* Zero the buffer */
-    memset(data, 0, (capacity_bits + 7) / 8);
-}
-
-bool bcl_buffer_write(BclBuffer *b, int bit) {
-    if (b->len >= b->capacity) return false;
-    u64 byte_idx = b->len / 8;
-    u64 bit_idx = b->len % 8;
-    if (bit) {
-        b->data[byte_idx] |= (1 << (7 - bit_idx));
-    }
+void bcl_buffer_init(BclBuffer *b) { stack_init(&b->bytes, 1); b->len = 0; }
+void bcl_buffer_write(BclBuffer *b, int bit) {
+    if (b->len % 8 == 0) stack_push(&b->bytes);   /* a fresh byte, zeroed */
+    if (bit) STACK_AT(&b->bytes, u8, b->len / 8) |= (u8)(1 << (7 - b->len % 8));
     b->len++;
-    return true;
 }
-
-u64 bcl_buffer_len(BclBuffer *b) {
-    return b->len;
-}
+u64 bcl_buffer_len(const BclBuffer *b) { return b->len; }
+const u8 *bcl_buffer_data(const BclBuffer *b) { return (const u8 *)b->bytes.p; }
+void bcl_buffer_drop(BclBuffer *b) { stack_drop(&b->bytes); b->len = 0; }
 
 /*
  * BCL Parsing
@@ -76,51 +63,52 @@ u64 bcl_buffer_len(BclBuffer *b) {
  *       | 1 T T   (App)
  */
 
-SKITerm *bcl_parse(SKIPool *p, BclStream *s) {
-    int bit = bcl_stream_read(s);
-    if (bit < 0) return NULL;  /* unexpected EOF */
-    
-    if (bit == 0) {
-        /* 00 = K, 01 = S */
-        int bit2 = bcl_stream_read(s);
-        if (bit2 < 0) return NULL;
-        if (bit2 == 0) {
-            return ski_k(p);
-        } else {
-            return ski_s(p);
+/* A prefix code parsed by an explicit machine, not recursion: an application's frame waits for its left result, then
+   its right. leaf_fn reads one non-application code (the first bit, 0, already read): NULL on a truncated or invalid
+   code, and then the whole parse fails and what was built is released. */
+typedef struct { SKITerm *l; int have_l; } PFrame;
+static Stack parse_st = { NULL, 0, 0, sizeof(PFrame) };
+static SKITerm *prefix_parse(SKIPool *p, BclStream *s, SKITerm *(*leaf_fn)(SKIPool *, BclStream *)) {
+    size_t base = parse_st.n;
+    for (;;) {
+        int bit = bcl_stream_read(s);
+        if (bit < 0) goto fail;   /* unexpected EOF */
+        if (bit == 1) { PFrame f = { NULL, 0 }; STACK_PUSH(&parse_st, PFrame, f); continue; }
+        SKITerm *t = leaf_fn(p, s);
+        if (!t) goto fail;
+        /* a complete term: it completes the frames it finishes, innermost first */
+        for (;;) {
+            if (parse_st.n == base) return t;
+            PFrame *f = &STACK_TOP(&parse_st, PFrame);
+            if (!f->have_l) { f->l = t; f->have_l = 1; break; }
+            t = ski_app(p, f->l, t); parse_st.n--;
         }
-    } else {
-        /* 1 X Y = App(X, Y) */
-        SKITerm *left = bcl_parse(p, s);
-        if (!left) return NULL;
-        
-        SKITerm *right = bcl_parse(p, s);
-        if (!right) {
-            ski_unref(p, left);
-            return NULL;
-        }
-        
-        SKITerm *app = ski_app(p, left, right);
-        if (!app) {
-            ski_unref(p, left);
-            ski_unref(p, right);
-            return NULL;
-        }
-        return app;
     }
+fail:
+    while (parse_st.n > base) { PFrame f = STACK_POP(&parse_st, PFrame); if (f.have_l) ski_unref(p, f.l); }
+    return NULL;
 }
+
+/* BCL: after the 0, one more bit: 00 K, 01 S */
+static SKITerm *bcl_leaf(SKIPool *p, BclStream *s) {
+    int bit2 = bcl_stream_read(s);
+    if (bit2 < 0) return NULL;
+    return bit2 == 0 ? ski_k(p) : ski_s(p);
+}
+SKITerm *bcl_parse(SKIPool *p, BclStream *s) { return prefix_parse(p, s, bcl_leaf); }
 
 /*
  * BCL Emission
  */
 
-/* A leaf's pure S K spelling (ski_expansion), written out: '1' application, S = 01, K = 00, other letters expand in turn */
+/* A leaf's pure S K spelling (ski_expansion), written out: '1' application, S = 01, K = 00, other letters expand in
+   turn (recursion only through the constant expansion strings) */
 static bool emit_expansion(BclBuffer *b, const char *e) {
     for (; *e; e++) {
         switch (*e) {
-        case '1': if (!bcl_buffer_write(b, 1)) return false; break;
-        case 'S': if (!bcl_buffer_write(b, 0) || !bcl_buffer_write(b, 1)) return false; break;
-        case 'K': if (!bcl_buffer_write(b, 0) || !bcl_buffer_write(b, 0)) return false; break;
+        case '1': bcl_buffer_write(b, 1); break;
+        case 'S': bcl_buffer_write(b, 0); bcl_buffer_write(b, 1); break;
+        case 'K': bcl_buffer_write(b, 0); bcl_buffer_write(b, 0); break;
         case 'I': if (!emit_expansion(b, ski_expansion(TERM_I))) return false; break;
         case 'B': if (!emit_expansion(b, ski_expansion(TERM_B))) return false; break;
         case 'C': if (!emit_expansion(b, ski_expansion(TERM_C))) return false; break;
@@ -145,39 +133,45 @@ static u64 expansion_size(const char *e) {
     return n;
 }
 
-bool bcl_emit(SKITerm *t, BclBuffer *b) {
+/* A prefix-code emission walk: an application writes its 1 and then its left and right subterms, in order - a
+   depth-first walk on a heap stack (the right subterm pushed under the left). leaf_fn writes a leaf, false when the
+   leaf has no spelling in the format. */
+static Stack emit_st = { NULL, 0, 0, sizeof(SKITerm *) };
+static bool prefix_emit(SKITerm *t, BclBuffer *b, bool (*leaf_fn)(SKITerm *, BclBuffer *)) {
     if (!t) return false;
-    
-    switch (t->tag) {
-    case TERM_APP:
-        return bcl_buffer_write(b, 1) &&
-               bcl_emit(t->app.left, b) &&
-               bcl_emit(t->app.right, b);
-    case TERM_WORD:
-    case TERM_PRIM:
-        return false;   /* no pure spelling: see xbcl_emit */
-    default:
-        return emit_expansion(b, ski_expansion(t->tag));
+    size_t base = emit_st.n;
+    STACK_PUSH(&emit_st, SKITerm *, t);
+    while (emit_st.n > base) {
+        SKITerm *x = STACK_POP(&emit_st, SKITerm *);
+        if (x->tag == TERM_APP) {
+            bcl_buffer_write(b, 1);
+            STACK_PUSH(&emit_st, SKITerm *, x->app.right); STACK_PUSH(&emit_st, SKITerm *, x->app.left);
+            continue;
+        }
+        if (!leaf_fn(x, b)) { emit_st.n = base; return false; }
     }
+    return true;
 }
-
-/*
- * Size calculation
- */
-
-u64 bcl_size(SKITerm *t) {
+/* a term's size under a format: 1 per application plus its leaves' sizes, summed by a walk on a heap stack */
+static u64 prefix_size(SKITerm *t, u64 (*leaf_fn)(SKITerm *)) {
     if (!t) return 0;
-    
-    switch (t->tag) {
-    case TERM_APP:
-        return 1 + bcl_size(t->app.left) + bcl_size(t->app.right);
-    case TERM_WORD:
-    case TERM_PRIM:
-        return 0;
-    default:
-        return expansion_size(ski_expansion(t->tag));
+    size_t base = emit_st.n; u64 n = 0;
+    STACK_PUSH(&emit_st, SKITerm *, t);
+    while (emit_st.n > base) {
+        SKITerm *x = STACK_POP(&emit_st, SKITerm *);
+        if (x->tag == TERM_APP) { n += 1; STACK_PUSH(&emit_st, SKITerm *, x->app.right); STACK_PUSH(&emit_st, SKITerm *, x->app.left); continue; }
+        n += leaf_fn(x);
     }
+    return n;
 }
+
+static bool bcl_leaf_emit(SKITerm *t, BclBuffer *b) {
+    if (t->tag == TERM_WORD || t->tag == TERM_PRIM) return false;   /* no pure spelling: see xbcl_emit */
+    return emit_expansion(b, ski_expansion(t->tag));
+}
+static u64 bcl_leaf_size(SKITerm *t) { return t->tag == TERM_WORD || t->tag == TERM_PRIM ? 0 : expansion_size(ski_expansion(t->tag)); }
+bool bcl_emit(SKITerm *t, BclBuffer *b) { return prefix_emit(t, b, bcl_leaf_emit); }
+u64 bcl_size(SKITerm *t) { return prefix_size(t, bcl_leaf_size); }
 
 /*
  * XBCL (see bcl.h)
@@ -186,8 +180,7 @@ u64 bcl_size(SKITerm *t) {
 _Static_assert(XB_PRIM0 + PRIM_COUNT <= 32, "the extended-leaf codes must fit five bits");   /* the codes are bcl.h's */
 
 static bool write_bits(BclBuffer *b, u64 v, int n) {
-    for (int i = n - 1; i >= 0; i--)
-        if (!bcl_buffer_write(b, (v >> i) & 1)) return false;
+    for (int i = n - 1; i >= 0; i--) bcl_buffer_write(b, (v >> i) & 1);
     return true;
 }
 
@@ -202,18 +195,8 @@ static int read_bits(BclStream *s, int n, u64 *out) {
     return 0;
 }
 
-SKITerm *xbcl_parse(SKIPool *p, BclStream *s) {
-    int bit = bcl_stream_read(s);
-    if (bit < 0) return NULL;
-    if (bit == 1) {
-        SKITerm *left = xbcl_parse(p, s);
-        if (!left) return NULL;
-        SKITerm *right = xbcl_parse(p, s);
-        if (!right) { ski_unref(p, left); return NULL; }
-        SKITerm *app = ski_app(p, left, right);
-        if (!app) { ski_unref(p, left); ski_unref(p, right); return NULL; }
-        return app;
-    }
+/* XBCL: after the 0: 0 K, 10 S, 11 ccccc a leaf by code */
+static SKITerm *xbcl_leaf(SKIPool *p, BclStream *s) {
     int b2 = bcl_stream_read(s);
     if (b2 < 0) return NULL;
     if (b2 == 0) return ski_k(p);
@@ -238,6 +221,7 @@ SKITerm *xbcl_parse(SKIPool *p, BclStream *s) {
         return NULL;
     }
 }
+SKITerm *xbcl_parse(SKIPool *p, BclStream *s) { return prefix_parse(p, s, xbcl_leaf); }
 
 static int xb_code(SKITag tag) {
     switch (tag) {
@@ -250,12 +234,10 @@ static int xb_code(SKITag tag) {
     }
 }
 
-bool xbcl_emit(SKITerm *t, BclBuffer *b) {
-    if (!t) return false;
+static bool xbcl_leaf_emit(SKITerm *t, BclBuffer *b) {
     switch (t->tag) {
     case TERM_K: return write_bits(b, 0, 2);
     case TERM_S: return write_bits(b, 2, 3);
-    case TERM_APP: return bcl_buffer_write(b, 1) && xbcl_emit(t->app.left, b) && xbcl_emit(t->app.right, b);
     case TERM_WORD: return write_bits(b, 3, 3) && write_bits(b, XB_WORD, 5) && write_bits(b, t->word, 64);
     case TERM_PRIM: return write_bits(b, 3, 3) && write_bits(b, XB_PRIM0 + t->op, 5);
     default: {
@@ -264,14 +246,13 @@ bool xbcl_emit(SKITerm *t, BclBuffer *b) {
     }
     }
 }
-
-u64 xbcl_size(SKITerm *t) {
-    if (!t) return 0;
+static u64 xbcl_leaf_size(SKITerm *t) {
     switch (t->tag) {
     case TERM_K: return 2;
     case TERM_S: return 3;
-    case TERM_APP: return 1 + xbcl_size(t->app.left) + xbcl_size(t->app.right);
     case TERM_WORD: return 3 + 5 + 64;
     default: return 3 + 5;
     }
 }
+bool xbcl_emit(SKITerm *t, BclBuffer *b) { return prefix_emit(t, b, xbcl_leaf_emit); }
+u64 xbcl_size(SKITerm *t) { return prefix_size(t, xbcl_leaf_size); }

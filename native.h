@@ -251,7 +251,8 @@ typedef struct {
 /*
  * Initialize emitter with output format selection
  */
-void native_emit_init(NativeEmit *e, u8 *code_buf, u32 code_cap, OutputFormat fmt);
+void native_emit_init(NativeEmit *e, OutputFormat fmt);   /* the code buffer is the emitter's own: native_emit_drop */
+void native_emit_drop(NativeEmit *e);
 
 /*
  * Emit the complete runtime (combinators + GC + output + entry)

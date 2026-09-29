@@ -4,7 +4,7 @@ LIB=libeezo.a
 
 OFILES=\
 	term.$O\
-	res.$O\
+	mem.$O\
 	bn.$O\
 	bcl.$O\
 	jomplement.$O\
@@ -14,7 +14,7 @@ OFILES=\
 HFILES=\
 	types.h\
 	term.h\
-	res.h\
+	mem.h\
 	bn.h\
 	bcl.h\
 	jomplement.h\

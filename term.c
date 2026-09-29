@@ -1,109 +1,41 @@
-#include "res.h"
 /*
  * term.c - SKI combinator term implementation
+ *
+ * The terms live in a pool of the memory layer (mem.h): it grows, and running out of memory is the layer's resource
+ * abort, so no constructor returns NULL. Every walk over a term is an explicit machine on a heap stack (a static
+ * Stack per walker, reused), not C recursion: a term's depth is bounded by memory alone.
  */
+#include "mem.h"
 #include "term.h"
 #include <stdlib.h>
 #include <stdio.h>
 
-/*
- * Pool management
- */
+void ski_pool_init(SKIPool *p) { pool_setup(&p->p, sizeof(SKITerm), 0); }
+void ski_pool_drop(SKIPool *p) { pool_drop(&p->p); }
+size_t ski_pool_live(SKIPool *p) { return p->p.live; }
 
-void pool_init(SKIPool *p, u32 capacity) {
-    p->pool = rcalloc(capacity, sizeof(SKITerm));
-    p->capacity = capacity;
-    p->next_free = 0;
-    p->freelist = NULL;
-}
-
-void pool_free(SKIPool *p) {
-    free(p->pool);
-    p->pool = NULL;
-    p->capacity = 0;
-}
-
-void pool_reset(SKIPool *p) {
-    p->next_free = 0;
-    p->freelist = NULL;
-}
-
-u32 pool_used(SKIPool *p) {
-    /* Count freelist length */
-    u32 free_count = 0;
-    for (SKITerm *t = p->freelist; t; t = t->app.left)
-        free_count++;
-    return p->next_free - free_count;
-}
-
-static SKITerm *pool_alloc(SKIPool *p) {
-    if (p->freelist) {
-        SKITerm *t = p->freelist;
-        p->freelist = t->app.left;
-        return t;
-    }
-    if (p->next_free >= p->capacity) {
-        return NULL;
-    }
-    return &p->pool[p->next_free++];
-}
-
-static void pool_release(SKIPool *p, SKITerm *t) {
-    t->app.left = p->freelist;
-    p->freelist = t;
-}
-
-/*
- * SKITerm constructors
- */
-
-SKITerm *ski_s(SKIPool *p) {
-    SKITerm *t = pool_alloc(p);
-    if (!t) return NULL;
-    t->tag = TERM_S;
+static SKITerm *leaf(SKIPool *p, SKITag tag) {
+    SKITerm *t = pool_get(&p->p);
+    t->tag = tag;
     t->refs = 1;
     return t;
 }
-
-SKITerm *ski_k(SKIPool *p) {
-    SKITerm *t = pool_alloc(p);
-    if (!t) return NULL;
-    t->tag = TERM_K;
-    t->refs = 1;
-    return t;
-}
-
-SKITerm *ski_i(SKIPool *p) {
-    SKITerm *t = pool_alloc(p);
-    if (!t) return NULL;
-    t->tag = TERM_I;
-    t->refs = 1;
-    return t;
-}
-
+SKITerm *ski_s(SKIPool *p) { return leaf(p, TERM_S); }
+SKITerm *ski_k(SKIPool *p) { return leaf(p, TERM_K); }
+SKITerm *ski_i(SKIPool *p) { return leaf(p, TERM_I); }
+SKITerm *ski_b(SKIPool *p) { return leaf(p, TERM_B); }
+SKITerm *ski_c(SKIPool *p) { return leaf(p, TERM_C); }
+SKITerm *ski_t(SKIPool *p) { return leaf(p, TERM_T); }
+SKITerm *ski_r(SKIPool *p) { return leaf(p, TERM_R); }
+SKITerm *ski_word(SKIPool *p, u64 w) { SKITerm *t = leaf(p, TERM_WORD); t->word = w; return t; }
+SKITerm *ski_prim(SKIPool *p, PrimOp op) { SKITerm *t = leaf(p, TERM_PRIM); t->op = op; return t; }
 SKITerm *ski_app(SKIPool *p, SKITerm *left, SKITerm *right) {
-    SKITerm *t = pool_alloc(p);
-    if (!t) return NULL;
-    t->tag = TERM_APP;
-    t->refs = 1;
+    SKITerm *t = leaf(p, TERM_APP);
     t->app.left = left;
     t->app.right = right;
     return t;
 }
 
-static SKITerm *leaf(SKIPool *p, SKITag tag) {
-    SKITerm *t = pool_alloc(p);
-    if (!t) return NULL;
-    t->tag = tag;
-    t->refs = 1;
-    return t;
-}
-SKITerm *ski_b(SKIPool *p) { return leaf(p, TERM_B); }
-SKITerm *ski_c(SKIPool *p) { return leaf(p, TERM_C); }
-SKITerm *ski_t(SKIPool *p) { return leaf(p, TERM_T); }
-SKITerm *ski_r(SKIPool *p) { return leaf(p, TERM_R); }
-SKITerm *ski_word(SKIPool *p, u64 w) { SKITerm *t = leaf(p, TERM_WORD); if (t) t->word = w; return t; }
-SKITerm *ski_prim(SKIPool *p, PrimOp op) { SKITerm *t = leaf(p, TERM_PRIM); if (t) t->op = op; return t; }
 int ski_arity(SKITag tag) {
     switch (tag) {
     case TERM_S: case TERM_B: case TERM_C: case TERM_R: return 3;
@@ -134,7 +66,8 @@ const char *ski_expansion(SKITag tag) {
     }
 }
 
-/* A leaf's expansion string (ski_expansion) as a term */
+/* A leaf's expansion string (ski_expansion) as a term. It recurses, but only through the constant expansion strings
+   (a few levels), never through a term's own depth. */
 static SKITerm *expansion_term(SKIPool *p, const char **e) {
     char c = *(*e)++;
     switch (c) {
@@ -143,22 +76,44 @@ static SKITerm *expansion_term(SKIPool *p, const char **e) {
     case 'I': { const char *x = ski_expansion(TERM_I); return expansion_term(p, &x); }
     case 'B': { const char *x = ski_expansion(TERM_B); return expansion_term(p, &x); }
     case 'C': { const char *x = ski_expansion(TERM_C); return expansion_term(p, &x); }
-    case '1': {
-        SKITerm *l = expansion_term(p, e);
-        if (!l) return NULL;
-        SKITerm *r = expansion_term(p, e);
-        if (!r) { ski_unref(p, l); return NULL; }
-        SKITerm *a = ski_app(p, l, r);
-        if (!a) { ski_unref(p, l); ski_unref(p, r); }
-        return a;
-    }
+    case '1': { SKITerm *l = expansion_term(p, e); SKITerm *r = expansion_term(p, e); return ski_app(p, l, r); }
     default: return NULL;
     }
 }
 
-typedef struct { SKITerm *leaf[4]; } PureLeaves;   /* B C T R, built once each */
+/* Rebuilding a term bottom-up with each leaf replaced (leaf returns NULL: no replacement, the whole rebuild fails and
+   the part built is released). Frames: the application, and its left result once built. */
+typedef struct { SKITerm *t, *l; int st; } BFrame;
+static Stack rebuild_st = { NULL, 0, 0, sizeof(BFrame) };
+static SKITerm *rebuild(SKIPool *p, SKITerm *t, SKITerm *(*leaf_fn)(SKIPool *, SKITerm *, void *), void *d) {
+    size_t base = rebuild_st.n;
+    SKITerm *ret = NULL; int have = 0;
+    BFrame f0 = { t, NULL, 0 }; STACK_PUSH(&rebuild_st, BFrame, f0);
+    while (rebuild_st.n > base) {
+        BFrame *f = &STACK_TOP(&rebuild_st, BFrame);
+        if (!have) {
+            if (f->t->tag != TERM_APP) {
+                ret = leaf_fn(p, f->t, d); rebuild_st.n--;
+                if (!ret) goto fail;
+                have = 1; continue;
+            }
+            BFrame c = { f->st == 0 ? f->t->app.left : f->t->app.right, NULL, 0 };
+            STACK_PUSH(&rebuild_st, BFrame, c);
+            continue;
+        }
+        have = 0;
+        if (f->st == 0) { f->l = ret; f->st = 1; continue; }
+        ret = ski_app(p, f->l, ret); rebuild_st.n--; have = 1;
+    }
+    return ret;
+fail:   /* the left results the open frames hold are released with them */
+    while (rebuild_st.n > base) { BFrame f = STACK_POP(&rebuild_st, BFrame); if (f.st == 1) ski_unref(p, f.l); }
+    return NULL;
+}
 
-static SKITerm *expand_pure(SKIPool *p, SKITerm *t, PureLeaves *pl) {
+typedef struct { SKITerm *leaf[4]; } PureLeaves;   /* B C T R, built once each */
+static SKITerm *pure_leaf(SKIPool *p, SKITerm *t, void *d) {
+    PureLeaves *pl = d;
     switch (t->tag) {
     case TERM_S: return ski_s(p);
     case TERM_K: return ski_k(p);
@@ -168,37 +123,34 @@ static SKITerm *expand_pure(SKIPool *p, SKITerm *t, PureLeaves *pl) {
         if (!pl->leaf[i]) { const char *x = ski_expansion(t->tag); pl->leaf[i] = expansion_term(p, &x); }
         return ski_ref(pl->leaf[i]);
     }
-    case TERM_APP: {
-        SKITerm *l = expand_pure(p, t->app.left, pl);
-        if (!l) return NULL;
-        SKITerm *r = expand_pure(p, t->app.right, pl);
-        if (!r) { ski_unref(p, l); return NULL; }
-        SKITerm *a = ski_app(p, l, r);
-        if (!a) { ski_unref(p, l); ski_unref(p, r); }
-        return a;
-    }
-    default: return NULL;   /* words and primitives */
+    default: return NULL;   /* words and primitives: no pure spelling */
     }
 }
 
 SKITerm *ski_expand_pure(SKIPool *p, SKITerm *t) {
     PureLeaves pl = { { NULL, NULL, NULL, NULL } };
-    SKITerm *r = expand_pure(p, t, &pl);
+    SKITerm *r = rebuild(p, t, pure_leaf, &pl);
     for (int i = 0; i < 4; i++) ski_unref(p, pl.leaf[i]);   /* the result holds its own references */
     return r;
 }
 
-bool ski_uses_words(SKITerm *t) {
+/* does any leaf of t satisfy the test? (a depth-first walk on a heap stack) */
+static Stack any_st = { NULL, 0, 0, sizeof(SKITerm *) };
+static bool any_leaf(SKITerm *t, bool (*test)(SKITerm *)) {
     if (!t) return false;
-    if (t->tag == TERM_APP) return ski_uses_words(t->app.left) || ski_uses_words(t->app.right);
-    return t->tag == TERM_WORD || t->tag == TERM_PRIM;
+    size_t base = any_st.n;
+    STACK_PUSH(&any_st, SKITerm *, t);
+    while (any_st.n > base) {
+        SKITerm *x = STACK_POP(&any_st, SKITerm *);
+        if (x->tag == TERM_APP) { STACK_PUSH(&any_st, SKITerm *, x->app.right); STACK_PUSH(&any_st, SKITerm *, x->app.left); continue; }
+        if (test(x)) { any_st.n = base; return true; }
+    }
+    return false;
 }
-
-bool ski_uses_extended(SKITerm *t) {
-    if (!t) return false;
-    if (t->tag == TERM_APP) return ski_uses_extended(t->app.left) || ski_uses_extended(t->app.right);
-    return t->tag != TERM_S && t->tag != TERM_K && t->tag != TERM_I;
-}
+static bool is_word_leaf(SKITerm *x) { return x->tag == TERM_WORD || x->tag == TERM_PRIM; }
+static bool is_extended_leaf(SKITerm *x) { return x->tag != TERM_S && x->tag != TERM_K && x->tag != TERM_I; }
+bool ski_uses_words(SKITerm *t) { return any_leaf(t, is_word_leaf); }
+bool ski_uses_extended(SKITerm *t) { return any_leaf(t, is_extended_leaf); }
 
 /*
  * Reference counting
@@ -209,54 +161,34 @@ SKITerm *ski_ref(SKITerm *t) {
     return t;
 }
 
+/* a term whose last reference goes releases its children's references in turn: a worklist, not recursion */
+static Stack unref_st = { NULL, 0, 0, sizeof(SKITerm *) };
 void ski_unref(SKIPool *p, SKITerm *t) {
-    if (!t) return;
-    if (--t->refs == 0) {
-        if (t->tag == TERM_APP) {
-            ski_unref(p, t->app.left);
-            ski_unref(p, t->app.right);
+    if (!t || --t->refs) return;
+    size_t base = unref_st.n;
+    STACK_PUSH(&unref_st, SKITerm *, t);
+    while (unref_st.n > base) {
+        SKITerm *x = STACK_POP(&unref_st, SKITerm *);
+        if (x->tag == TERM_APP) {
+            SKITerm *l = x->app.left, *r = x->app.right;
+            if (l && --l->refs == 0) STACK_PUSH(&unref_st, SKITerm *, l);
+            if (r && --r->refs == 0) STACK_PUSH(&unref_st, SKITerm *, r);
         }
-        pool_release(p, t);
+        pool_put(&p->p, x);
     }
 }
 
 /*
  * Deep copy
  */
-
-SKITerm *ski_copy(SKIPool *p, SKITerm *t) {
-    if (!t) return NULL;
-    
-    switch (t->tag) {
-    case TERM_S: return ski_s(p);
-    case TERM_K: return ski_k(p);
-    case TERM_I: return ski_i(p);
-    case TERM_B: return ski_b(p);
-    case TERM_C: return ski_c(p);
-    case TERM_T: return ski_t(p);
-    case TERM_R: return ski_r(p);
-    case TERM_WORD: return ski_word(p, t->word);
-    case TERM_PRIM: return ski_prim(p, t->op);
-    case TERM_APP: {
-        SKITerm *left = ski_copy(p, t->app.left);
-        if (!left) return NULL;
-        SKITerm *right = ski_copy(p, t->app.right);
-        if (!right) {
-            ski_unref(p, left);
-            return NULL;
-        }
-        SKITerm *app = ski_app(p, left, right);
-        if (!app) {
-            ski_unref(p, left);
-            ski_unref(p, right);
-            return NULL;
-        }
-        return app;
-    }
-    default:
-        return NULL;
-    }
+static SKITerm *copy_leaf(SKIPool *p, SKITerm *t, void *d) {
+    (void)d;
+    SKITerm *c = leaf(p, t->tag);
+    if (t->tag == TERM_WORD) c->word = t->word;
+    else if (t->tag == TERM_PRIM) c->op = t->op;
+    return c;
 }
+SKITerm *ski_copy(SKIPool *p, SKITerm *t) { return t ? rebuild(p, t, copy_leaf, NULL) : NULL; }
 
 /*
  * Reduction
@@ -289,76 +221,29 @@ static bool is_redex(SKITerm *t) {
     return s.n >= 0 && s.n == ski_arity(s.head->tag);
 }
 
-/* 
- * Find leftmost-outermost redex (iterative with explicit stack).
- * Returns pointer to the SKITerm* that holds the redex.
- * 
- * We traverse left-first (leftmost), and check for redex at each app node
- * before descending (outermost). Uses a stack to avoid recursion.
+/*
+ * Find the leftmost-outermost redex: a depth-first walk on a heap stack, checking each application before its
+ * children (outermost) and the left child before the right (leftmost). Returns the slot holding the redex, NULL when
+ * there is none - only then: the walk has no depth limit (it had a fixed 4096-entry array that answered "no redex"
+ * when a spine was deeper).
  */
-#define REDEX_STACK_SIZE 4096
-
+static Stack redex_st = { NULL, 0, 0, sizeof(SKITerm **) };
 static SKITerm **find_redex(SKITerm **tp) {
-    /* Stack of (pointer-to-pointer, phase) pairs */
-    /* Phase 0: check this node, then push left */
-    /* Phase 1: left done, push right */
-    /* Phase 2: done with this node */
-    struct { SKITerm **tp; int phase; } stack[REDEX_STACK_SIZE];
-    int sp = 0;
-    
     if (!*tp || (*tp)->tag != TERM_APP) return NULL;
-    
-    stack[sp].tp = tp;
-    stack[sp].phase = 0;
-    sp++;
-    
-    while (sp > 0) {
-        int idx = sp - 1;
-        SKITerm **cur = stack[idx].tp;
+    redex_st.n = 0;
+    STACK_PUSH(&redex_st, SKITerm **, tp);
+    while (redex_st.n) {
+        SKITerm **cur = STACK_POP(&redex_st, SKITerm **);
         SKITerm *t = *cur;
-        int phase = stack[idx].phase;
-        
-        if (phase == 0) {
-            /* Check if this is a redex (outermost check) */
-            if (is_redex(t)) {
-                return cur;
-            }
-            
-            /* Not a redex, try left child first (leftmost) */
-            stack[idx].phase = 1;
-            
-            if (t->tag == TERM_APP && t->app.left && t->app.left->tag == TERM_APP) {
-                if (sp >= REDEX_STACK_SIZE) return NULL; /* Stack overflow */
-                stack[sp].tp = &t->app.left;
-                stack[sp].phase = 0;
-                sp++;
-            }
-        } else if (phase == 1) {
-            /* Left done, try right child */
-            stack[idx].phase = 2;
-            
-            if (t->tag == TERM_APP && t->app.right && t->app.right->tag == TERM_APP) {
-                if (sp >= REDEX_STACK_SIZE) return NULL; /* Stack overflow */
-                stack[sp].tp = &t->app.right;
-                stack[sp].phase = 0;
-                sp++;
-            }
-        } else {
-            /* Done with this node, pop */
-            sp--;
-        }
+        if (is_redex(t)) { redex_st.n = 0; return cur; }
+        if (t->app.right && t->app.right->tag == TERM_APP) STACK_PUSH(&redex_st, SKITerm **, &t->app.right);
+        if (t->app.left && t->app.left->tag == TERM_APP) STACK_PUSH(&redex_st, SKITerm **, &t->app.left);
     }
-    
     return NULL;
 }
 
-/* An application of two owned terms; on failure both are released and NULL returned */
-static SKITerm *app2(SKIPool *p, SKITerm *l, SKITerm *r) {
-    if (!l || !r) { ski_unref(p, l); ski_unref(p, r); return NULL; }
-    SKITerm *t = ski_app(p, l, r);
-    if (!t) { ski_unref(p, l); ski_unref(p, r); }
-    return t;
-}
+/* An application of two owned terms */
+static SKITerm *app2(SKIPool *p, SKITerm *l, SKITerm *r) { return ski_app(p, l, r); }
 
 /* pair x y = \p. p x y = C (T x) y */
 static SKITerm *mk_pair(SKIPool *p, SKITerm *x, SKITerm *y) {
@@ -474,46 +359,53 @@ bool ski_is_whnf(SKITerm *t) {
  * Comparison
  */
 
+static Stack eq_st = { NULL, 0, 0, sizeof(SKITerm *) };
 bool ski_equal(SKITerm *a, SKITerm *b) {
-    if (a == b) return true;
-    if (!a || !b) return false;
-    if (a->tag != b->tag) return false;
-    
-    if (a->tag == TERM_APP) {
-        return ski_equal(a->app.left, b->app.left) &&
-               ski_equal(a->app.right, b->app.right);
+    size_t base = eq_st.n;
+    STACK_PUSH(&eq_st, SKITerm *, a); STACK_PUSH(&eq_st, SKITerm *, b);
+    while (eq_st.n > base) {
+        SKITerm *y = STACK_POP(&eq_st, SKITerm *), *x = STACK_POP(&eq_st, SKITerm *);
+        if (x == y) continue;
+        if (!x || !y || x->tag != y->tag) { eq_st.n = base; return false; }
+        if (x->tag == TERM_APP) {
+            STACK_PUSH(&eq_st, SKITerm *, x->app.right); STACK_PUSH(&eq_st, SKITerm *, y->app.right);
+            STACK_PUSH(&eq_st, SKITerm *, x->app.left); STACK_PUSH(&eq_st, SKITerm *, y->app.left);
+        }
     }
-    
     return true;
 }
 
 /*
- * Debug printing
+ * Debug printing: the pieces still to print (a term, or a closing/separating string) on a heap stack
  */
-
-void ski_fprint(FILE *f, SKITerm *t) {
-    if (!t) {
-        fprintf(f, "NULL");
-        return;
-    }
-    
-    switch (t->tag) {
-        case TERM_S: fprintf(f, "S"); break;
-        case TERM_K: fprintf(f, "K"); break;
-        case TERM_I: fprintf(f, "I"); break;
-        case TERM_B: fprintf(f, "B"); break;
-        case TERM_C: fprintf(f, "C"); break;
-        case TERM_T: fprintf(f, "T"); break;
-        case TERM_R: fprintf(f, "R"); break;
-        case TERM_WORD: fprintf(f, "#%llu", (unsigned long long)t->word); break;
-        case TERM_PRIM: fprintf(f, "#%s", prim_name(t->op)); break;
-        case TERM_APP:
-            fprintf(f, "(");
-            ski_fprint(f, t->app.left);
-            fprintf(f, " ");
-            ski_fprint(f, t->app.right);
-            fprintf(f, ")");
-            break;
+typedef struct { SKITerm *t; const char *s; } PPiece;
+static Stack print_st = { NULL, 0, 0, sizeof(PPiece) };
+void ski_fprint(FILE *f, SKITerm *t0) {
+    size_t base = print_st.n;
+    PPiece p0 = { t0, NULL }; STACK_PUSH(&print_st, PPiece, p0);
+    while (print_st.n > base) {
+        PPiece pc = STACK_POP(&print_st, PPiece);
+        if (pc.s) { fputs(pc.s, f); continue; }
+        SKITerm *t = pc.t;
+        if (!t) { fprintf(f, "NULL"); continue; }
+        switch (t->tag) {
+            case TERM_S: fprintf(f, "S"); break;
+            case TERM_K: fprintf(f, "K"); break;
+            case TERM_I: fprintf(f, "I"); break;
+            case TERM_B: fprintf(f, "B"); break;
+            case TERM_C: fprintf(f, "C"); break;
+            case TERM_T: fprintf(f, "T"); break;
+            case TERM_R: fprintf(f, "R"); break;
+            case TERM_WORD: fprintf(f, "#%llu", (unsigned long long)t->word); break;
+            case TERM_PRIM: fprintf(f, "#%s", prim_name(t->op)); break;
+            case TERM_APP: {
+                fprintf(f, "(");
+                PPiece close = { NULL, ")" }, sp = { NULL, " " }, r = { t->app.right, NULL }, l = { t->app.left, NULL };
+                STACK_PUSH(&print_st, PPiece, close); STACK_PUSH(&print_st, PPiece, r);
+                STACK_PUSH(&print_st, PPiece, sp); STACK_PUSH(&print_st, PPiece, l);
+                break;
+            }
+        }
     }
 }
 

@@ -9,6 +9,7 @@
 
 #include <stdio.h>
 #include "types.h"
+#include "mem.h"
 
 typedef enum {
     TERM_S,
@@ -58,19 +59,13 @@ struct SKITerm {
     };
 };
 
-/* Allocation pool for terms */
-typedef struct {
-    SKITerm *pool;
-    u32 capacity;
-    u32 next_free;
-    SKITerm *freelist;
-} SKIPool;
+/* The terms' pool: a pool of the memory layer (mem.h). It grows; running out of memory is the layer's resource abort,
+ * so no constructor below returns NULL. */
+typedef struct { Pool p; } SKIPool;
 
-/* Pool management */
-void pool_init(SKIPool *p, u32 capacity);
-void pool_free(SKIPool *p);
-void pool_reset(SKIPool *p);  /* Clear all terms, reuse memory */
-u32  pool_used(SKIPool *p);   /* Count of allocated terms */
+void ski_pool_init(SKIPool *p);
+void ski_pool_drop(SKIPool *p);        /* every term, and the pages */
+size_t ski_pool_live(SKIPool *p);      /* terms currently allocated */
 
 /* SKITerm constructors */
 SKITerm *ski_s(SKIPool *p);
@@ -99,7 +94,7 @@ SKITerm *ski_expand_pure(SKIPool *p, SKITerm *t);
 bool ski_uses_words(SKITerm *t);
 /* Does the term contain any extended leaf (B C T R, words, primitives)? */
 bool ski_uses_extended(SKITerm *t);
-/* The value of a saturated primitive on two words: a fresh term, NULL if the pool is exhausted */
+/* The value of a saturated primitive on two words: a fresh term (NULL only for an unknown primitive) */
 SKITerm *prim_apply(SKIPool *p, PrimOp op, u64 a, u64 b);
 
 /* Reference counting */

@@ -8,19 +8,18 @@
 #define EEZO_X86_H
 
 #include "types.h"
+#include "mem.h"
 
 /*
- * Code buffer for emission
+ * Code buffer for emission: a growable Stack of the memory layer (mem.h). Offsets into it are u32 - the reach of the
+ * rel32 jumps the code is made of - so it may not pass 2 GB (a resource abort, never a silent truncation).
  */
-typedef struct {
-    u8 *buf;        /* code buffer */
-    u32 cap;        /* capacity in bytes */
-    u32 len;        /* current length */
-} X86Buf;
+typedef struct { Stack bytes; } X86Buf;
+#define X86_BUF(b) ((u8 *)(b)->bytes.p)
 
-void x86_init(X86Buf *b, u8 *buf, u32 cap);
+void x86_init(X86Buf *b);
+void x86_drop(X86Buf *b);
 u32  x86_len(X86Buf *b);
-u8  *x86_ptr(X86Buf *b);  /* current write position */
 
 /*
  * Register encoding
