@@ -32,6 +32,8 @@ void resource_die(const char *fmt, ...) {
     exit(70);
 }
 
+unsigned long long mem_budget(void) { return mem_limit; }
+
 void mem_account(size_t n) {
     mem_total += n ? n : 1;
     if (mem_total > mem_limit)

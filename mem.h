@@ -33,6 +33,7 @@ void mem_init(const char *tool, const char *budget_env);
 void resource_die(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
 void mem_on_die(void (*hook)(void));   /* a tool's diagnostics, printed before the abort's message */
 void mem_account(size_t n);   /* bytes about to be requested from the system: dies past the budget */
+unsigned long long mem_budget(void);   /* the budget in bytes, ~0 when none is set */
 
 /* plain blocks, for what has its own lifetime (a file's contents, a string handed to a caller) */
 void *rmalloc(size_t n);
