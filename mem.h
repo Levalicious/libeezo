@@ -31,6 +31,7 @@
 /* the tool's name (the failure message's prefix) and the environment variable that may set its budget */
 void mem_init(const char *tool, const char *budget_env);
 void resource_die(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
+void mem_on_die(void (*hook)(void));   /* a tool's diagnostics, printed before the abort's message */
 void mem_account(size_t n);   /* bytes about to be requested from the system: dies past the budget */
 
 /* plain blocks, for what has its own lifetime (a file's contents, a string handed to a caller) */

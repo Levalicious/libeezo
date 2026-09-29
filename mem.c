@@ -11,6 +11,8 @@
 static const char *mem_tool;
 static unsigned long long mem_total, mem_limit = ~0ULL;
 static const char *mem_limit_env;
+static void (*mem_die_hook)(void);
+void mem_on_die(void (*hook)(void)) { mem_die_hook = hook; }
 
 void mem_init(const char *tool, const char *budget_env) {
     mem_tool = tool;
@@ -21,6 +23,7 @@ void mem_init(const char *tool, const char *budget_env) {
 
 void resource_die(const char *fmt, ...) {
     va_list ap;
+    if (mem_die_hook) { void (*h)(void) = mem_die_hook; mem_die_hook = NULL; h(); }   /* once: the hook may itself run out */
     fflush(stdout);
     if (mem_tool) fprintf(stderr, "%s: ", mem_tool);
     fputs("resource limit: ", stderr);

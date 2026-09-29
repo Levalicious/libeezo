@@ -15,27 +15,20 @@
 #include "x86.h"
 #include <string.h>
 
-void x86_init(X86Buf *b, u8 *buf, u32 cap) {
-    b->buf = buf;
-    b->cap = cap;
-    b->len = 0;
-}
+void x86_init(X86Buf *b) { stack_init(&b->bytes, 1); }
+void x86_drop(X86Buf *b) { stack_drop(&b->bytes); }
 
 u32 x86_len(X86Buf *b) {
-    return b->len;
-}
-
-u8 *x86_ptr(X86Buf *b) {
-    return b->buf + b->len;
+    return (u32)b->bytes.n;
 }
 
 /*
  * Raw byte emission
  */
+/* the buffer grows; it used to drop bytes silently once a fixed capacity was full */
 void x86_byte(X86Buf *b, u8 v) {
-    if (b->len < b->cap) {
-        b->buf[b->len++] = v;
-    }
+    if (b->bytes.n >= 0x7FFFFFFF) resource_die("native code past 2 GB, beyond the reach of a rel32 jump");
+    *(u8 *)stack_push(&b->bytes) = v;
 }
 
 void x86_word(X86Buf *b, u16 v) {
@@ -513,8 +506,8 @@ void x86_int3(X86Buf *b) {
  */
 void x86_patch_rel32(X86Buf *b, u32 patch_offset, u32 target_offset) {
     i32 rel = (i32)target_offset - (i32)(patch_offset + 4);
-    b->buf[patch_offset + 0] = rel & 0xFF;
-    b->buf[patch_offset + 1] = (rel >> 8) & 0xFF;
-    b->buf[patch_offset + 2] = (rel >> 16) & 0xFF;
-    b->buf[patch_offset + 3] = (rel >> 24) & 0xFF;
+    X86_BUF(b)[patch_offset + 0] = rel & 0xFF;
+    X86_BUF(b)[patch_offset + 1] = (rel >> 8) & 0xFF;
+    X86_BUF(b)[patch_offset + 2] = (rel >> 16) & 0xFF;
+    X86_BUF(b)[patch_offset + 3] = (rel >> 24) & 0xFF;
 }

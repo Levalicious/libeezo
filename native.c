@@ -45,9 +45,10 @@ static void emit_syscall(X86Buf *b) {
 /*
  * Initialize emitter with output format
  */
-void native_emit_init(NativeEmit *e, u8 *code_buf, u32 code_cap, OutputFormat fmt) {
+void native_emit_drop(NativeEmit *e) { x86_drop(&e->code); }
+void native_emit_init(NativeEmit *e, OutputFormat fmt) {
     memset(e, 0, sizeof(*e));
-    x86_init(&e->code, code_buf, code_cap);
+    x86_init(&e->code);
     e->data_size = DATA_SECTION_SIZE;
     e->output_fmt = fmt;
     e->nf_mode = 1;
@@ -2107,7 +2108,7 @@ static void emit_output(NativeEmit *e) {
     
     /* Patch Halt's jump to point to output routine */
     i32 rel = e->output_offset - (e->halt_output_patch + 4);
-    memcpy(e->code.buf + e->halt_output_patch, &rel, 4);
+    memcpy(X86_BUF(&e->code) + e->halt_output_patch, &rel, 4);
 }
 
 /*
@@ -2158,7 +2159,7 @@ void native_emit_runtime(NativeEmit *e) {
  */
 u8 *native_get_code(NativeEmit *e, u32 *size) {
     *size = x86_len(&e->code);
-    return e->code.buf;
+    return X86_BUF(&e->code);
 }
 
 u32 native_get_entry(NativeEmit *e) {
@@ -2208,7 +2209,7 @@ NativeJIT *native_jit_prepare(NativeEmit *e, u32 heap_size) {
     jit->code = mmap(NULL, code_size, PROT_READ | PROT_WRITE | PROT_EXEC,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (jit->code == MAP_FAILED) resource_die("out of memory (%u bytes of code)", code_size);
-    memcpy(jit->code, e->code.buf, code_size);
+    memcpy(jit->code, X86_BUF(&e->code), code_size);
     jit->code_size = code_size;
     
     /* Allocate data section */
@@ -2742,7 +2743,7 @@ void native_emit_elf(NativeEmit *e, u8 **out, u32 *out_size, SKITerm *term, u32 
     
     /* Patch the jump to _start */
     i32 start_rel = e->start_offset - (e->elf_start_jmp_patch + 4);
-    memcpy(e->code.buf + e->elf_start_jmp_patch, &start_rel, 4);
+    memcpy(X86_BUF(&e->code) + e->elf_start_jmp_patch, &start_rel, 4);
     
     /* Calculate term size and total data section size */
     u32 term_size = calc_term_size(term);
@@ -2759,7 +2760,7 @@ void native_emit_elf(NativeEmit *e, u8 **out, u32 *out_size, SKITerm *term, u32 
     /* LEA uses RIP-relative: disp = target - (rip after instruction) */
     /* RIP after LEA = code_vaddr + elf_lea_patch + 4 */
     i32 lea_disp = data_vaddr - (code_vaddr + e->elf_lea_patch + 4);
-    memcpy(e->code.buf + e->elf_lea_patch, &lea_disp, 4);
+    memcpy(X86_BUF(&e->code) + e->elf_lea_patch, &lea_disp, 4);
     
     /* Fill in data section */
     u64 *d = (u64*)data;
@@ -2836,7 +2837,7 @@ void native_emit_elf(NativeEmit *e, u8 **out, u32 *out_size, SKITerm *term, u32 
     phdr->p_align = 0x1000;
     
     /* Copy code */
-    memcpy(elf + header_size, e->code.buf, code_size);
+    memcpy(elf + header_size, X86_BUF(&e->code), code_size);
     
     /* Copy data */
     memcpy(elf + header_size + code_size, data, data_size);
