@@ -51,7 +51,7 @@ typedef struct SKITerm SKITerm;
 
 struct SKITerm {
     SKITag tag;
-    u32 refs;
+    u64 refs;       /* 64 bits: a term shared past 2^32 references is not an overflow */
     union {
         struct { SKITerm *left; SKITerm *right; } app;
         u64 word;       /* TERM_WORD */
