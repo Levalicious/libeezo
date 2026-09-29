@@ -1091,19 +1091,22 @@ static void emit_gc(NativeEmit *e) {
     emit_store_data(b, DATA_LIMIT, R13);
     x86_pop(b, R14); x86_pop(b, RBP); x86_pop(b, RBX);
     x86_ret(b);
-    /* OOM: write "OOM\n" to stderr, exit 137 */
+    /* the heap could not grow (the kernel refused, or the budget): the toolchain's resource abort,
+       "resource limit: out of memory" on stderr and exit 70 (Decision_ResourceAbortStandard) */
     for (int i = 0; i < n_oom; i++) x86_patch_rel32(b, oom_patch[i], x86_len(b));
-    x86_push(b, RAX);
-    x86_mov_ri(b, RAX, 0x0A4D4F4F);
-    x86_mov_mr(b, RSP, 0, RAX);
-    x86_mov_ri(b, RAX, SYS_write);
-    x86_mov_ri(b, RDI, 2);
-    x86_mov_rr(b, RSI, RSP);
-    x86_mov_ri(b, RDX, 4);
-    emit_syscall(b);
-    x86_mov_ri(b, RAX, SYS_exit);
-    x86_mov_ri(b, RDI, 137);
-    emit_syscall(b);
+    {
+        static const char msg[32] = "resource limit: out of memory\n";   /* 30 bytes, written from the stack */
+        x86_add_ri(b, RSP, -32);
+        for (int q = 0; q < 4; q++) { u64 w; memcpy(&w, msg + 8 * q, 8); x86_mov_ri(b, RAX, w); x86_mov_mr(b, RSP, 8 * q, RAX); }
+        x86_mov_ri(b, RAX, SYS_write);
+        x86_mov_ri(b, RDI, 2);
+        x86_mov_rr(b, RSI, RSP);
+        x86_mov_ri(b, RDX, 30);
+        emit_syscall(b);
+        x86_mov_ri(b, RAX, SYS_exit);
+        x86_mov_ri(b, RDI, 70);
+        emit_syscall(b);
+    }
     /* subroutine calls */
     for (int i = 0; i < 3; i++) x86_patch_rel32(b, rc[i], e->gc_copy_offset);
     x86_patch_rel32(b, sv1, e->gc_scavenge_offset);
@@ -2170,7 +2173,7 @@ u32 native_get_entry(NativeEmit *e) {
  * JIT EXECUTION
  * ======================================================================== */
 
-static u32 calc_term_size(SKITerm *term);
+static u64 calc_term_size(SKITerm *term);
 
 /* The extended singletons in a data section: B C T R and Prim[op] for every op. code_base: where the entry offsets are relative to. */
 static void fill_extended_singletons(u8 *data, u64 code_base, const u32 *entry_offsets) {
@@ -2186,18 +2189,16 @@ static void fill_extended_singletons(u8 *data, u64 code_base, const u32 *entry_o
 }
 
 /*
- * The growth ceiling of one semispace. -H sets the INITIAL size only: a
- * small initial heap (chosen to exercise the grow path) must not lower the
- * ceiling below what a default run gets, so the ceiling is 16x the larger
- * of the two.
+ * The growth ceiling of one semispace under the JIT. There is no size the machine owes us: the heaps grow until the
+ * kernel refuses (mremap fails: the runtime's resource abort), or, when the tool runs under a memory budget (mem.h),
+ * until half of it - the two spaces together. It was 16x the initial size, 256 MiB by default.
  */
-u64 native_max_space(u32 heap_size) {
-    u64 m = (u64)heap_size * 16;
-    u64 d = (u64)NATIVE_DEFAULT_HEAP_SIZE * 16;
-    return m > d ? m : d;
+u64 native_max_space(void) {
+    unsigned long long b = mem_budget();
+    return b == ~0ULL ? ~0ULL : (u64)(b / 2);
 }
 
-NativeJIT *native_jit_prepare(NativeEmit *e, u32 heap_size) {
+NativeJIT *native_jit_prepare(NativeEmit *e, u64 heap_size) {
     /* The JIT's own memory goes through the memory layer (mem.h): its failure is the layer's resource abort. The heaps
        mapped here are the running program's, grown and collected by the emitted code itself. */
     NativeJIT *jit = rcalloc(1, sizeof(NativeJIT));
@@ -2222,7 +2223,7 @@ NativeJIT *native_jit_prepare(NativeEmit *e, u32 heap_size) {
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     jit->heap1 = mmap(NULL, heap_size, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (jit->heap0 == MAP_FAILED || jit->heap1 == MAP_FAILED) resource_die("out of memory (two heaps of %u bytes)", heap_size);
+    if (jit->heap0 == MAP_FAILED || jit->heap1 == MAP_FAILED) resource_die("out of memory (two heaps of %llu bytes)", (unsigned long long)heap_size);
     
     /* Initialize data section */
     u64 *data = (u64*)jit->data;
@@ -2244,7 +2245,7 @@ NativeJIT *native_jit_prepare(NativeEmit *e, u32 heap_size) {
     data[DATA_KI / 8 + 1] = (u64)jit->data + DATA_PRIM_I;
     data[DATA_HP / 8] = (u64)jit->heap0;
     data[DATA_LIMIT / 8] = (u64)jit->heap0 + heap_size;
-    data[DATA_MAX_SPACE_SIZE / 8] = native_max_space(heap_size);
+    data[DATA_MAX_SPACE_SIZE / 8] = native_max_space();
     data[DATA_ALLOC_REQUEST / 8] = 0;
     data[DATA_OUTPUT_XOR / 8] = (e->output_fmt == OUTPUT_JOMPLEMENT) ? 1 : 0;
     
@@ -2282,95 +2283,90 @@ void native_jit_free(NativeJIT *jit) {
 }
 
 /*
- * Build a term on the heap.
- *
- * Recursively converts SKITerm tree to native closures.
- * Returns pointer to root closure (absolute address).
- * Updates *hp_ptr to new heap position.
- *
- * S, K, I return pointers to singletons in data section.
- * App allocates a 3-word closure on heap.
+ * A term's closures laid out in memory: the JIT's heap, or the ELF's data section. Leaves S K I B C T R and the
+ * primitives are the singletons in the data section; a word is 2 words, an application 3 (entry, function, argument),
+ * each application after both of its subterms (depth first, left before right). im.buf is where the closures are
+ * written, im.base the address they will have when the program runs (the same for the JIT, the load address for the
+ * ELF). An explicit machine on a heap stack, not C recursion: a term's depth is bounded by memory alone.
  */
-static u64 build_term_recursive(NativeJIT *jit, SKITerm *term, u8 **hp_ptr) {
-    u64 *data = (u64*)jit->data;
-    
-    switch (term->tag) {
-        case TERM_S:
-            /* Return address of singleton S in data section */
-            return (u64)((u8*)jit->data + DATA_PRIM_S);
-            
-        case TERM_K:
-            return (u64)((u8*)jit->data + DATA_PRIM_K);
-            
-        case TERM_I:
-            return (u64)((u8*)jit->data + DATA_PRIM_I);
-        case TERM_B:
-            return (u64)((u8*)jit->data + DATA_PRIM_B);
-        case TERM_C:
-            return (u64)((u8*)jit->data + DATA_PRIM_C);
-        case TERM_T:
-            return (u64)((u8*)jit->data + DATA_PRIM_T);
-        case TERM_R:
-            return (u64)((u8*)jit->data + DATA_PRIM_R);
-        case TERM_PRIM:
-            return (u64)((u8*)jit->data + DATA_PRIM_OPS + 16 * (u64)term->op);
-
-        case TERM_WORD: {
-            /* Word[w] - 2 words */
-            u64 *w = (u64*)*hp_ptr;
-            *hp_ptr += 16;
-            w[0] = data[(DATA_ENTRY_TABLE / 8) + CLOS_WORD];
-            w[1] = term->word;
-            return (u64)w;
-        }
-            
-        case TERM_APP: {
-            /* Build children first (depth-first) */
-            u64 f_ptr = build_term_recursive(jit, term->app.left, hp_ptr);
-            u64 x_ptr = build_term_recursive(jit, term->app.right, hp_ptr);
-            
-            /* Allocate App[f, x] - 3 words */
-            u64 *app = (u64*)*hp_ptr;
-            *hp_ptr += 24;
-            
-            app[0] = data[(DATA_ENTRY_TABLE / 8) + CLOS_APP];
-            app[1] = f_ptr;
-            app[2] = x_ptr;
-            
-            return (u64)app;
-        }
+typedef struct { u8 *buf; u64 base, data_addr, app_entry, word_entry; } TermImage;
+typedef struct { SKITerm *t; u64 f; int st; } ImgFrame;
+static Stack img_st = { NULL, 0, 0, sizeof(ImgFrame) };
+static u64 image_leaf(TermImage *im, SKITerm *t, u64 *hp) {
+    switch (t->tag) {
+    case TERM_S: return im->data_addr + DATA_PRIM_S;
+    case TERM_K: return im->data_addr + DATA_PRIM_K;
+    case TERM_I: return im->data_addr + DATA_PRIM_I;
+    case TERM_B: return im->data_addr + DATA_PRIM_B;
+    case TERM_C: return im->data_addr + DATA_PRIM_C;
+    case TERM_T: return im->data_addr + DATA_PRIM_T;
+    case TERM_R: return im->data_addr + DATA_PRIM_R;
+    case TERM_PRIM: return im->data_addr + DATA_PRIM_OPS + 16 * (u64)t->op;
+    case TERM_WORD: {
+        u64 *w = (u64 *)(im->buf + *hp);
+        w[0] = im->word_entry; w[1] = t->word;
+        u64 at = im->base + *hp; *hp += 16; return at;
     }
-    
-    fprintf(stderr, "native: internal: a term of unknown kind\n");
-    exit(1);
+    default:
+        fprintf(stderr, "native: internal: a term of unknown kind\n");
+        exit(1);
+    }
+}
+static u64 build_term_image(TermImage *im, SKITerm *term, u64 *hp) {
+    size_t base = img_st.n;
+    u64 ret = 0; int have = 0;
+    ImgFrame f0 = { term, 0, 0 }; STACK_PUSH(&img_st, ImgFrame, f0);
+    while (img_st.n > base) {
+        ImgFrame *f = &STACK_TOP(&img_st, ImgFrame);
+        if (!have) {
+            if (f->t->tag != TERM_APP) { ret = image_leaf(im, f->t, hp); img_st.n--; have = 1; continue; }
+            ImgFrame c = { f->st == 0 ? f->t->app.left : f->t->app.right, 0, 0 };
+            STACK_PUSH(&img_st, ImgFrame, c);
+            continue;
+        }
+        have = 0;
+        if (f->st == 0) { f->f = ret; f->st = 1; continue; }
+        u64 *app = (u64 *)(im->buf + *hp);   /* both subterms built: the application after them */
+        app[0] = im->app_entry; app[1] = f->f; app[2] = ret;
+        ret = im->base + *hp; *hp += 24;
+        img_st.n--; have = 1;
+    }
+    return ret;
+}
+/* the bytes a term's closures take (the singletons none): a walk on a heap stack */
+static Stack size_st = { NULL, 0, 0, sizeof(SKITerm *) };
+static u64 calc_term_size(SKITerm *term) {
+    size_t base = size_st.n; u64 n = 0;
+    STACK_PUSH(&size_st, SKITerm *, term);
+    while (size_st.n > base) {
+        SKITerm *t = STACK_POP(&size_st, SKITerm *);
+        if (t->tag == TERM_APP) { n += 24; STACK_PUSH(&size_st, SKITerm *, t->app.right); STACK_PUSH(&size_st, SKITerm *, t->app.left); }
+        else if (t->tag == TERM_WORD) n += 16;
+    }
+    return n;
 }
 
 /*
- * Build term on heap and set up for execution.
- * Returns 0 on success, -1 on failure (e.g., term too large).
+ * Build term on heap and set up for execution (the heaps sized to it first). Returns 0.
  */
 /*
  * The heaps must hold the initial program before anything runs. Size them
  * to the term - a power of two with as much again to work in - remapping
  * the spaces native_jit_prepare made if they are too small.
  */
-static int jit_size_heaps(NativeJIT *jit, u32 need) {
+static int jit_size_heaps(NativeJIT *jit, u64 need) {
     u64 want = jit->heap_size;
-    while (want < (u64)need * 2) want *= 2;
-    if (want > 0xFFFFFFFFull) return -1;
+    while (want < need * 2) { if (want > ~0ULL / 4) resource_die("a term of %llu bytes", (unsigned long long)need); want *= 2; }
     if (want == jit->heap_size) return 0;
+    mem_account(want * 2);
     void *h0 = mmap(NULL, want, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     void *h1 = mmap(NULL, want, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (h0 == MAP_FAILED || h1 == MAP_FAILED) {
-        if (h0 != MAP_FAILED) munmap(h0, want);
-        if (h1 != MAP_FAILED) munmap(h1, want);
-        return -1;
-    }
+    if (h0 == MAP_FAILED || h1 == MAP_FAILED) resource_die("out of memory (two heaps of %llu bytes)", (unsigned long long)want);
     munmap(jit->heap0, jit->heap_size);
     munmap(jit->heap1, jit->heap_size);
     jit->heap0 = h0;
     jit->heap1 = h1;
-    jit->heap_size = (u32)want;
+    jit->heap_size = want;
     u64 *data = (u64*)jit->data;
     data[DATA_SPACE0 / 8] = (u64)h0;
     data[DATA_SPACE1 / 8] = (u64)h1;
@@ -2379,20 +2375,22 @@ static int jit_size_heaps(NativeJIT *jit, u32 need) {
     data[DATA_SPACE1_SIZE / 8] = want;
     data[DATA_HP / 8] = (u64)h0;
     data[DATA_LIMIT / 8] = (u64)h0 + want;
-    data[DATA_MAX_SPACE_SIZE / 8] = native_max_space((u32)want);
+    data[DATA_MAX_SPACE_SIZE / 8] = native_max_space();
     return 0;
 }
 
 int native_jit_load_term(NativeJIT *jit, SKITerm *term) {
     /* Never write past the space: size it first, then build */
-    u32 need = calc_term_size(term);
-    if (jit_size_heaps(jit, need) != 0 || need > jit->heap_size) return -1;
-    u8 *hp = (u8*)jit->heap0;
-    u64 root = build_term_recursive(jit, term, &hp);
+    u64 need = calc_term_size(term);
+    jit_size_heaps(jit, need);
+    u64 *data = (u64*)jit->data;
+    TermImage im = { (u8*)jit->heap0, (u64)jit->heap0, (u64)jit->data,
+                     data[(DATA_ENTRY_TABLE / 8) + CLOS_APP], data[(DATA_ENTRY_TABLE / 8) + CLOS_WORD] };
+    u64 hp = 0;
+    u64 root = build_term_image(&im, term, &hp);
     
     /* Update heap pointer in data section */
-    u64 *data = (u64*)jit->data;
-    data[DATA_HP / 8] = (u64)hp;
+    data[DATA_HP / 8] = (u64)jit->heap0 + hp;
     
     /* Store root as the initial term to evaluate */
     /* The start code will load this and enter it */
@@ -2515,7 +2513,7 @@ typedef struct {
  *
  * Returns offset of ELF entry point.
  */
-static u32 emit_elf_start(NativeEmit *e, u32 heap_size) {
+static u32 emit_elf_start(NativeEmit *e, u64 heap_size) {
     X86Buf *b = &e->code;
     u32 entry = x86_len(b);
     
@@ -2562,8 +2560,9 @@ static u32 emit_elf_start(NativeEmit *e, u32 heap_size) {
     x86_mov_mr(b, R15, DATA_SPACE0, RAX);
     /* Also set as initial HP */
     x86_mov_mr(b, R15, DATA_HP, RAX);
-    /* Calculate and store limit */
-    x86_add_ri(b, RAX, heap_size);
+    /* Calculate and store limit (the size as a 64-bit immediate: add's immediate is 32 bits, sign-extended) */
+    x86_mov_ri(b, RCX, heap_size);
+    x86_add_rr(b, RAX, RCX);
     x86_mov_mr(b, R15, DATA_LIMIT, RAX);
     
     /* mmap heap1 */
@@ -2594,7 +2593,7 @@ static u32 emit_elf_start(NativeEmit *e, u32 heap_size) {
     x86_mov_mr(b, R15, DATA_NF_MODE, RAX);
     x86_mov_ri(b, RAX, e->io_mode);
     x86_mov_mr(b, R15, DATA_IO_MODE, RAX);
-    x86_mov_ri(b, RAX, native_max_space(heap_size));
+    x86_mov_ri(b, RAX, ~0ULL);   /* a standalone program's heaps grow until the kernel refuses */
     x86_mov_mr(b, R15, DATA_MAX_SPACE_SIZE, RAX);
     
     /* Entry table is already in data section (baked in) */
@@ -2612,100 +2611,6 @@ static u32 emit_elf_start(NativeEmit *e, u32 heap_size) {
 }
 
 /*
- * Calculate term size in bytes (for heap allocation).
- * S, K, I are singletons (0 bytes on heap).
- * App costs 24 bytes (3 words).
- */
-static u32 calc_term_size(SKITerm *term) {
-    switch (term->tag) {
-        case TERM_S:
-        case TERM_K:
-        case TERM_I:
-            return 0;  /* singletons, no heap allocation */
-        case TERM_B:
-        case TERM_C:
-        case TERM_T:
-        case TERM_R:
-        case TERM_PRIM:
-            return 0;  /* singletons in the data section */
-        case TERM_WORD:
-            return 16;
-        case TERM_APP:
-            return 24 + calc_term_size(term->app.left) + calc_term_size(term->app.right);
-    }
-    fprintf(stderr, "native: internal: a term of unknown kind\n");
-    exit(1);
-}
-
-/*
- * Build term for ELF embedding.
- *
- * Similar to build_term_recursive, but uses virtual addresses instead of
- * runtime pointers. The term is built into a buffer that will be embedded
- * in the ELF data section.
- *
- * Parameters:
- *   buf      - buffer to write term closures into
- *   buf_vaddr - virtual address where buf will be loaded at runtime
- *   hp       - current write position in buf (updated)
- *   code_vaddr - virtual address of code section (for entry pointers)
- *   data_vaddr - virtual address of data section (for singletons)
- *   entry_offsets - array of entry point offsets
- *
- * Returns virtual address of the built term.
- */
-static u64 build_term_for_elf(SKITerm *term, u8 *buf, u64 buf_vaddr, u32 *hp,
-                               u64 code_vaddr, u64 data_vaddr, u32 *entry_offsets) {
-    switch (term->tag) {
-        case TERM_S:
-            return data_vaddr + DATA_PRIM_S;
-        case TERM_K:
-            return data_vaddr + DATA_PRIM_K;
-        case TERM_I:
-            return data_vaddr + DATA_PRIM_I;
-        case TERM_B:
-            return data_vaddr + DATA_PRIM_B;
-        case TERM_C:
-            return data_vaddr + DATA_PRIM_C;
-        case TERM_T:
-            return data_vaddr + DATA_PRIM_T;
-        case TERM_R:
-            return data_vaddr + DATA_PRIM_R;
-        case TERM_PRIM:
-            return data_vaddr + DATA_PRIM_OPS + 16 * (u64)term->op;
-
-        case TERM_WORD: {
-            u32 offset = *hp;
-            *hp += 16;
-            u64 *w = (u64*)(buf + offset);
-            w[0] = code_vaddr + entry_offsets[CLOS_WORD];
-            w[1] = term->word;
-            return buf_vaddr + offset;
-        }
-        case TERM_APP: {
-            /* Build children first */
-            u64 f_vaddr = build_term_for_elf(term->app.left, buf, buf_vaddr, hp,
-                                              code_vaddr, data_vaddr, entry_offsets);
-            u64 x_vaddr = build_term_for_elf(term->app.right, buf, buf_vaddr, hp,
-                                              code_vaddr, data_vaddr, entry_offsets);
-            
-            /* Allocate App closure */
-            u32 offset = *hp;
-            *hp += 24;
-            
-            u64 *app = (u64*)(buf + offset);
-            app[0] = code_vaddr + entry_offsets[CLOS_APP];  /* entry pointer */
-            app[1] = f_vaddr;
-            app[2] = x_vaddr;
-            
-            return buf_vaddr + offset;
-        }
-    }
-    fprintf(stderr, "native: internal: a term of unknown kind\n");
-    exit(1);
-}
-
-/*
  * Emit ELF executable.
  *
  * The ELF contains:
@@ -2719,7 +2624,7 @@ static u64 build_term_for_elf(SKITerm *term, u8 *buf, u64 buf_vaddr, u32 *hp,
  *
  * Caller must free *out.
  */
-void native_emit_elf(NativeEmit *e, u8 **out, u32 *out_size, SKITerm *term, u32 heap_size) {
+void native_emit_elf(NativeEmit *e, u8 **out, u64 *out_size, SKITerm *term, u64 heap_size) {
     /*
      * Memory layout at runtime:
      *   0x400000: ELF header + phdr
@@ -2746,8 +2651,8 @@ void native_emit_elf(NativeEmit *e, u8 **out, u32 *out_size, SKITerm *term, u32 
     memcpy(X86_BUF(&e->code) + e->elf_start_jmp_patch, &start_rel, 4);
     
     /* Calculate term size and total data section size */
-    u32 term_size = calc_term_size(term);
-    u32 data_size = DATA_SECTION_SIZE + term_size;
+    u64 term_size = calc_term_size(term);
+    u64 data_size = DATA_SECTION_SIZE + term_size;
     /* Align to 8 bytes */
     data_size = (data_size + 7) & ~7;
     
@@ -2784,9 +2689,10 @@ void native_emit_elf(NativeEmit *e, u8 **out, u32 *out_size, SKITerm *term, u32 
     
     /* Build initial term in data section after fixed fields */
     u64 term_buf_vaddr = data_vaddr + DATA_SECTION_SIZE;
-    u32 term_hp = 0;
-    u64 root_vaddr = build_term_for_elf(term, data + DATA_SECTION_SIZE, term_buf_vaddr,
-                                         &term_hp, code_vaddr, data_vaddr, e->entry_offsets);
+    u64 term_hp = 0;
+    TermImage im = { data + DATA_SECTION_SIZE, term_buf_vaddr, data_vaddr,
+                     code_vaddr + e->entry_offsets[CLOS_APP], code_vaddr + e->entry_offsets[CLOS_WORD] };
+    u64 root_vaddr = build_term_image(&im, term, &term_hp);
     
     /* Set DATA_ROOT to point to the embedded term */
     d[DATA_ROOT / 8] = root_vaddr;
@@ -2798,7 +2704,7 @@ void native_emit_elf(NativeEmit *e, u8 **out, u32 *out_size, SKITerm *term, u32 
     d[DATA_KI / 8 + 1] = data_vaddr + DATA_PRIM_I;
     
     /* Calculate total file size */
-    u32 total_size = header_size + code_size + data_size;
+    u64 total_size = (u64)header_size + code_size + data_size;
     
     /* Allocate output buffer */
     u8 *elf = rmalloc(total_size);
